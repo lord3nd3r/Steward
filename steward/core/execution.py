@@ -7,6 +7,7 @@ not written into the command string, the database, or notes.
 from __future__ import annotations
 
 import hashlib
+import re
 import shlex
 import socket
 import subprocess
@@ -16,12 +17,55 @@ from pathlib import Path
 
 import paramiko
 
-from steward.core.approval import apply_sudo_password, scrub_secret
+from steward.core.approval import apply_sudo_password, classify_command, scrub_secret
 from steward.core.errors import StewardError
 from steward.core.models import CommandResult, Machine
 from steward.core.store import Store
 
 _MAX_BYTES = 64_000
+
+_PERMISSION_RE = re.compile(
+    r"permission denied"
+    r"|operation not permitted"
+    r"|superuser privileges"
+    r"|requires? superuser"
+    r"|must be (?:the )?root"
+    r"|need(?:s|ed)? to be root"
+    r"|you must be root"
+    r"|unless you are root"
+    r"|are you root\?"
+    r"|root privileges are required"
+    r"|could not open lock file"
+    r"|unable to lock directory"
+    r"|could not get lock",
+    re.IGNORECASE,
+)
+_SUDO_PASSWORD_RE = re.compile(
+    r"a password is required"
+    r"|a terminal is required"
+    r"|no password was provided"
+    r"|sorry, try again"
+    r"|incorrect password"
+    r"|authentication failure",
+    re.IGNORECASE,
+)
+_SUDO_REJECTED_RE = re.compile(
+    r"not in the sudoers|not allowed to execute|is not allowed to run",
+    re.IGNORECASE,
+)
+_SUDO_HINT = (
+    "Hint: permission denied. Retry once with sudo or doas if this needs root. "
+    "Steward will ask for approval and the password. Do not paste a password."
+)
+_SUDO_PASSWORD_HINT = (
+    "Hint: sudo needs a password. Retry the same command so Steward can prompt again. "
+    "Do not paste a password."
+)
+_SUDO_NONINTERACTIVE_HINT = (
+    "Hint: sudo -n cannot prompt. Retry the same command without -n. "
+    "Steward will ask for approval and the password. Do not paste a password."
+)
+_SUDO_REJECTED_HINT = "Hint: sudo was rejected. Do not retry it. Tell the user what failed."
 
 
 def run_local_command(
@@ -94,12 +138,17 @@ def run_ssh_command(
     cwd: str | None = None,
     sudo_password: str | None = None,
     cancel: threading.Event | None = None,
+    connect_timeout: int | None = None,
 ) -> CommandResult:
     command_to_run = command
     if cwd:
         command_to_run = f"cd {shlex.quote(cwd)} && {command_to_run}"
     command_to_run, stdin_bytes = apply_sudo_password(command_to_run, sudo_password)
-    client = connect_ssh(machine, store)
+    client = connect_ssh(
+        machine,
+        store,
+        timeout=15 if connect_timeout is None else connect_timeout,
+    )
     try:
         stdin, stdout, stderr = client.exec_command(command_to_run, timeout=timeout)
         if stdin_bytes and stdin is not None:
@@ -140,7 +189,7 @@ def run_ssh_command(
         client.close()
 
 
-def connect_ssh(machine: Machine, store: Store) -> paramiko.SSHClient:
+def connect_ssh(machine: Machine, store: Store, *, timeout: int = 15) -> paramiko.SSHClient:
     client = paramiko.SSHClient()
     client.load_system_host_keys()
     known_hosts = Path.home() / ".ssh" / "known_hosts"
@@ -159,7 +208,7 @@ def connect_ssh(machine: Machine, store: Store) -> paramiko.SSHClient:
         "hostname": machine.host,
         "port": machine.port,
         "username": machine.user,
-        "timeout": 15,
+        "timeout": timeout,
         "auth_timeout": 20,
         "banner_timeout": 15,
         "allow_agent": machine.use_agent,
@@ -287,12 +336,37 @@ def list_remote_directory(machine: Machine, store: Store, path: str) -> list[tup
         client.close()
 
 
-def format_command_result(result: CommandResult) -> str:
+def format_command_result(result: CommandResult, command: str | None = None) -> str:
     parts = [f"exit_code: {result.exit_code}"]
     parts.append("stdout:\n" + result.stdout if result.stdout else "stdout: (empty)")
     if result.stderr:
         parts.append("stderr:\n" + result.stderr)
+    if command:
+        hint = sudo_retry_hint(command, result)
+        if hint:
+            parts.append(hint)
     return "\n".join(parts)
+
+
+def sudo_retry_hint(command: str, result: CommandResult) -> str | None:
+    """Tell a small model how to recover from a privilege failure.
+
+    The hint is text in the tool result. The next command still goes through
+    approval, and Steward still refuses to store the sudo password.
+    """
+    if result.exit_code == 0:
+        return None
+    blob = f"{result.stderr}\n{result.stdout}"
+    privileged = classify_command(command).needs_sudo
+    if privileged and _SUDO_PASSWORD_RE.search(blob):
+        if re.search(r"\bsudo\s+(?:-n|--non-interactive)\b", command):
+            return _SUDO_NONINTERACTIVE_HINT
+        return _SUDO_PASSWORD_HINT
+    if privileged and _SUDO_REJECTED_RE.search(blob):
+        return _SUDO_REJECTED_HINT
+    if not privileged and _PERMISSION_RE.search(blob):
+        return _SUDO_HINT
+    return None
 
 
 def _remote_path(client: paramiko.SSHClient, sftp: paramiko.SFTPClient, path: str) -> str:

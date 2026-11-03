@@ -8,6 +8,7 @@ from steward.core.settings import Settings
 from steward.core.store import Store
 from steward.core.tools import default_registry
 from tests.fakes import ScriptedBackend
+from tests.support import add_computer
 
 
 def _runner(store, backend, settings=None):
@@ -49,6 +50,7 @@ def test_loop_runs_a_command_then_answers(tmp_path):
         ]
     )
     store = Store()
+    add_computer(store)
     agent = store.create_agent("House", model="scripted", approval_mode="full_auto")
     asked = []
     result = _runner(store, backend).run_turn(
@@ -75,6 +77,7 @@ def test_denied_command_does_not_run(tmp_path):
         ]
     )
     store = Store()
+    add_computer(store)
     agent = store.create_agent("House", model="scripted", approval_mode="ask")
     result = _runner(store, backend).run_turn(agent.id, "touch it", approval_handler=_deny_all)
     assert not target.exists()
@@ -98,6 +101,7 @@ def test_destructive_always_asks_even_in_full_auto(tmp_path):
         ]
     )
     store = Store()
+    add_computer(store)
     agent = store.create_agent("House", model="scripted", approval_mode="full_auto")
     calls = []
     _runner(store, backend).run_turn(
@@ -223,6 +227,7 @@ def test_sudo_password_is_reused_for_the_rest_of_the_turn(tmp_path):
         ]
     )
     store = Store()
+    add_computer(store)
     agent = store.create_agent("House", model="scripted", approval_mode="full_auto")
     calls = []
     settings = Settings()
@@ -235,3 +240,81 @@ def test_sudo_password_is_reused_for_the_rest_of_the_turn(tmp_path):
     _runner(store, backend, settings).run_turn(agent.id, "check sudo twice", approval_handler=approve)
     assert len(calls) == 1
     assert calls[0].needs_sudo
+    blob = " ".join(message.content for message in store.list_messages(agent.id))
+    assert "temporary" not in blob
+
+
+def test_no_machines_hides_command_tools_and_names_the_add_command(tmp_path):
+    from steward.core.messages import NO_MACHINES_MESSAGE
+    from steward.core.models import ApprovalDecision
+
+    target = tmp_path / "marker"
+    backend = ScriptedBackend(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="c1", name="run_command", arguments={"command": f"touch {target}"})],
+            ),
+            LLMResponse(content="Add a machine first."),
+        ]
+    )
+    store = Store()
+    agent = store.create_agent("House", model="scripted", approval_mode="full_auto")
+    asked = []
+
+    def approve(request):
+        asked.append(request)
+        return ApprovalDecision(approved=True)
+
+    result = _runner(store, backend).run_turn(agent.id, "install updates", approval_handler=approve)
+    assert not target.exists()
+    assert asked == []
+    assert NO_MACHINES_MESSAGE in backend.seen[1][-1].content
+    assert NO_MACHINES_MESSAGE in backend.seen[0][0].content
+    names = [item["function"]["name"] for item in backend.tools_seen[0]]
+    assert "run_command" not in names
+    assert "read_file" not in names
+    assert "save_note" in names
+    assert result.text == "Add a machine first."
+
+
+def test_permission_denied_hints_sudo_and_still_asks(tmp_path):
+    from steward.core.models import ApprovalDecision
+
+    backend = ScriptedBackend(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="c1",
+                        name="run_command",
+                        arguments={"command": "sh -c 'echo Permission denied >&2; exit 1'"},
+                    )
+                ],
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[ToolCall(id="c2", name="run_command", arguments={"command": "sudo true"})],
+            ),
+            LLMResponse(content="Retried with sudo."),
+        ]
+    )
+    store = Store()
+    add_computer(store)
+    agent = store.create_agent("House", model="scripted", approval_mode="full_auto")
+    calls = []
+    settings = Settings()
+    settings.command_timeout = 8
+
+    def approve(request):
+        calls.append(request)
+        return ApprovalDecision(approved=True, sudo_password="s3cret-value")
+
+    _runner(store, backend, settings).run_turn(agent.id, "install updates", approval_handler=approve)
+    assert "Retry once with sudo" in backend.seen[1][-1].content
+    assert len(calls) == 1
+    assert calls[0].needs_sudo
+    stored = " ".join(message.content for message in store.list_messages(agent.id))
+    assert "s3cret-value" not in stored
+    assert all("s3cret-value" not in event.result for event in store.list_tool_events(agent.id))

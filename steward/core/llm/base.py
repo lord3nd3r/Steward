@@ -56,7 +56,7 @@ def build_backend(settings: Settings, agent: Agent) -> LLMBackend:
 def list_backend_models(settings: Settings, backend: str) -> list[str]:
     probe = Agent(
         id="",
-        name="probe",
+        name="",
         persona="",
         backend=backend,
         model="",

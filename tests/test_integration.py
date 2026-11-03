@@ -8,7 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from steward.core.agent import AgentRunner
 from steward.core.llm.base import build_backend
-from steward.core.models import ApprovalDecision
+from steward.core.models import ApprovalDecision, Machine
 from steward.core.settings import Settings
 from steward.core.store import Store
 from steward.core.tools import default_registry
@@ -31,7 +31,7 @@ class _Handler(BaseHTTPRequestHandler):
                         "type": "function",
                         "function": {
                             "name": "run_command",
-                            "arguments": {"command": "echo hello-steward", "machine": "local"},
+                            "arguments": {"command": "echo hello-steward", "machine": "box"},
                         },
                     }
                 ],
@@ -76,6 +76,7 @@ def test_ollama_http_loop_runs_a_command_and_recalls_a_note():
         settings.ollama_base_url = f"http://127.0.0.1:{server.server_address[1]}"
         settings.command_timeout = 10
         store = Store()
+        store.upsert_machine(Machine(name="box", is_local=True))
         agent = store.create_agent("House", model="demo", backend="ollama", approval_mode="full_auto")
         runner = AgentRunner(store, settings, default_registry(), build_backend)
         tokens: list[str] = []

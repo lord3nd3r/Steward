@@ -67,20 +67,72 @@ def test_messages_keep_tool_calls_and_drop_orphan_tools():
     assert store.list_notes(agent.id) == []
 
 
-def test_machine_registry_rejects_local_and_updates():
+def test_fresh_store_has_no_agents_or_machines():
     store = Store()
-    with pytest.raises(StewardError):
-        store.upsert_machine(Machine(name="local", host="x", user="me"))
-    machine = store.upsert_machine(
-        Machine(name="SER", host="ser.local", user="ada", port=22, sudo_notes="password required")
-    )
-    assert store.get_machine("ser").host == "ser.local"
-    store.set_host_key_fingerprint("SER", "SHA256:abc")
-    assert store.get_machine("SER").host_key_fingerprint == "SHA256:abc"
-    renamed = store.upsert_machine(
-        Machine(name="SER", host="10.0.0.8", user="ada", sudo_notes="password required")
-    )
-    assert renamed.host == "10.0.0.8"
-    assert renamed.host_key_fingerprint == "SHA256:abc"
-    store.delete_machine("ser")
+    assert store.list_agents() == []
     assert store.list_machines() == []
+    again = Store(store.db_path)
+    assert again.list_agents() == []
+    assert again.list_machines() == []
+
+
+def test_machine_registry_requires_an_explicit_target_and_updates():
+    from steward.core.models import MachineFacts
+
+    store = Store()
+    here = store.upsert_machine(Machine(name="box", is_local=True))
+    assert here.is_local
+    assert here.host == ""
+    with pytest.raises(StewardError, match="already saved"):
+        store.upsert_machine(Machine(name="other", is_local=True))
+    machine = store.upsert_machine(
+        Machine(name="host", host="host.example", user="user", port=22, sudo_notes="password required")
+    )
+    assert store.get_machine("host").host == "host.example"
+    assert not machine.is_local
+    store.set_host_key_fingerprint("host", "SHA256:abc")
+    store.save_facts(MachineFacts(machine="host", os_id="debian", os_version="12", pkg="apt", sudo_state="sudo", user_name="user"))
+    updated = store.upsert_machine(
+        Machine(name="host", host="10.0.0.8", user="user", sudo_notes="password required")
+    )
+    assert updated.host == "10.0.0.8"
+    assert updated.host_key_fingerprint == "SHA256:abc"
+    assert store.get_facts("host") is None
+    kept = store.upsert_machine(
+        Machine(name="host", host="10.0.0.8", user="user", sudo_notes="still password")
+    )
+    assert kept.sudo_notes == "still password"
+    store.save_facts(MachineFacts(machine="host", os_id="debian", os_version="12", pkg="apt", sudo_state="sudo", user_name="user"))
+    store.delete_machine("host")
+    assert store.get_facts("host") is None
+    store.delete_machine("box")
+    assert store.list_machines() == []
+
+
+def test_old_database_is_not_given_a_machine(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "old.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """
+        CREATE TABLE machines (
+            name TEXT PRIMARY KEY,
+            host TEXT NOT NULL,
+            user TEXT NOT NULL,
+            port INTEGER NOT NULL,
+            identity_file TEXT,
+            sudo_notes TEXT NOT NULL DEFAULT '',
+            use_agent INTEGER NOT NULL DEFAULT 1,
+            host_key_fingerprint TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+    conn.execute("INSERT INTO machines (name, host, user, port) VALUES ('host', 'host.example', 'user', 22)")
+    conn.commit()
+    conn.close()
+    store = Store(db)
+    assert [item.name for item in store.list_agents()] == []
+    machines = store.list_machines()
+    assert [item.name for item in machines] == ["host"]
+    assert machines[0].is_local is False

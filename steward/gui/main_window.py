@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from steward.core.messages import NO_MACHINES_MESSAGE
 from steward.core.models import APPROVAL_LABELS, BACKEND_LABELS, TurnResult
 from steward.core.service import Steward
 from steward.gui.dialogs import AgentDialog, ApprovalDialog, MachineDialog, NotesDialog, SettingsDialog
@@ -136,8 +137,9 @@ class MainWindow(QMainWindow):
         self.transcript_scroll.viewport().setStyleSheet("background: #16130f;")
 
         self.empty = QLabel(
-            "No agents yet.\n\nAn agent is a named assistant with its own persona, "
-            "its own model, and a memory that stays on this machine."
+            "No agents yet.\n\n"
+            "Create your first agent. Steward starts empty: no sample agents, "
+            "and no machines until you add them."
         )
         self.empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty.setWordWrap(True)
@@ -147,6 +149,10 @@ class MainWindow(QMainWindow):
         self.error_banner.setObjectName("errorBanner")
         self.error_banner.setWordWrap(True)
         self.error_banner.hide()
+        self.machine_hint = QLabel("")
+        self.machine_hint.setObjectName("muted")
+        self.machine_hint.setWordWrap(True)
+        self.machine_hint.hide()
 
         self.composer = QPlainTextEdit()
         self.composer.setPlaceholderText("Ask something, or tell this agent a fact worth keeping.")
@@ -175,6 +181,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.empty)
         layout.addWidget(self.transcript_scroll, 1)
         layout.addWidget(self.error_banner)
+        layout.addWidget(self.machine_hint)
         layout.addLayout(composer_row)
         layout.addWidget(hint)
         return pane
@@ -252,10 +259,11 @@ class MainWindow(QMainWindow):
         self.send_button.setEnabled(not empty)
         if empty:
             self.agent_title.setText("Steward")
-            self.agent_persona.setText("Create an agent to start. Each one keeps its own model and its own notes.")
+            self.agent_persona.setText("Create your first agent. Each one keeps its own model and its own notes.")
             self.agent_meta.setText("")
             self._clear_transcript()
             self._clear_activity()
+        self._refresh_setup_hint()
 
     def _show_agent(self, agent_id: str) -> None:
         agent = self.steward.store.get_agent(agent_id)
@@ -271,7 +279,16 @@ class MainWindow(QMainWindow):
         self.agent_meta.setText(f"{backend}  ·  {agent.model}  ·  {approval}  ·  {agent.max_steps} steps")
         self.composer.setPlaceholderText(f"Ask {agent.name}, or tell it something worth remembering.")
         self._clear_error()
+        self._refresh_setup_hint()
         self._render_history(agent.id, agent.name)
+
+    def _refresh_setup_hint(self) -> None:
+        if self.steward.store.list_machines():
+            self.machine_hint.hide()
+            self.machine_hint.setText("")
+            return
+        self.machine_hint.setText(NO_MACHINES_MESSAGE)
+        self.machine_hint.show()
 
     def _render_history(self, agent_id: str, agent_name: str) -> None:
         self._clear_transcript()
@@ -433,6 +450,7 @@ class MainWindow(QMainWindow):
 
     def _open_machines(self) -> None:
         MachineDialog(self.steward, self).exec()
+        self._refresh_setup_hint()
 
     def _open_notes(self) -> None:
         if not self._agent_id:

@@ -1,6 +1,6 @@
 # Steward
 
-Steward is a local, multi-agent personal assistant for Linux. Each agent has its own name, persona, model, and memory. It talks to **Ollama** or **llama.cpp** (`llama-server`) on your machine, and it can actually do the work: run a shell command, read a file, or SSH to another computer you have registered, such as a machine named SER.
+Steward is a local, multi-agent personal assistant for Linux. Each agent has its own name, persona, model, and memory. It talks to **Ollama** or **llama.cpp** (`llama-server`) on your machine, and it can actually do the work: run a shell command, read a file, or SSH to another computer you have registered. A new install has no agents and no machines until you add them.
 
 The desktop app and the terminal share one Python core, so a turn behaves the same way in both.
 
@@ -38,7 +38,7 @@ Steward does not download models. Point it at one you already run. URLs live in 
 
 ```bash
 ollama serve
-ollama pull llama3.1
+ollama pull <model>
 steward models --backend ollama
 ```
 
@@ -57,33 +57,35 @@ Models that support native tool calls are used that way. If a server rejects too
 
 ```bash
 steward agents create \
-  --name House \
+  --name <agent> \
   --backend ollama \
-  --model llama3.1 \
+  --model <model> \
   --approval ask \
-  --persona "You look after the Linux machines on this network. You check before you change anything."
+  --persona "<what this agent should look after>"
 
-steward machines add SER \
-  --host ser.local \
-  --user ada \
+steward machines add <name> --local
+
+steward machines add <other> \
+  --host <host> \
+  --user <user> \
   --identity-file ~/.ssh/id_ed25519 \
-  --sudo-notes "Password required. User is in the sudo group."
+  --sudo-notes "Password required. The user is in the sudo group."
 
-steward chat --agent House
+steward chat --agent <agent>
 ```
 
 Then, in the chat:
 
 ```text
-Is SER fully up to date?
+Is <other> fully up to date?
 ```
 
-House will propose commands. Steward shows the exact command and the target machine and waits for `y` or `n`. A sudo password, if you type one, is passed to `sudo -S` on stdin for that turn and is not written to the database, the transcript, or the agent's notes.
+The agent will propose commands. Steward shows the exact command and the target machine and waits for `y` or `n`. A sudo password, if you type one, is passed to `sudo -S` on stdin for that turn and is not written to the database, the transcript, or the agent's notes.
 
 One-shot, from another program or a keybinding:
 
 ```bash
-steward ask --agent House "My webcam stopped after the last kernel update. Find out why."
+steward ask --agent <agent> "The webcam stopped after the last kernel update. Find out why."
 ```
 
 The window is the same assistant:
@@ -100,15 +102,17 @@ The sidebar is the list of agents. The transcript streams. The activity column i
 
 | Tool | What it does |
 | --- | --- |
-| `run_command` | Bash on `local`, or on a named machine over SSH |
-| `read_file` | Read a text file locally or over SFTP |
-| `write_file` | Replace a text file. Runs as the SSH user, not as root |
+| `run_command` | Bash on a saved machine: this computer, or another host over SSH |
+| `read_file` | Read a text file on a saved machine |
+| `write_file` | Replace a text file. Runs as the login user, not as root |
 | `list_directory` | List a directory |
 | `save_note` | Remember a fact. Same title updates the old note |
 | `search_notes` | Keyword search over this agent's notes |
 | `forget_note` | Delete one note by id or title |
 
-`local` is always available and is not stored as a machine. Other machines are a name, host, user, port, optional identity file, and a note about how sudo works there. The password itself is never part of that note.
+Nothing is registered for you. Add this computer with `steward machines add <name> --local`, or tick **This computer** in the Machines window. Other machines are a name, host, user, port, optional identity file, and a note about how sudo works there. The password itself is never part of that note. With no machines saved, command and file tools are not offered, and Steward tells you the command above.
+
+On the first turn that can use a machine, Steward reads each saved host once and caches a one-line summary: distro, package manager, whether that login is root, and whether `sudo` or `doas` is installed. Later turns reuse the cache. The probe is read-only and does not run `sudo`. `steward machines refresh` (or **Refresh facts** in the Machines window) reads them again. Changing a machine's host, user, or port drops its cache. Agents are prompted from that line: non-interactive package commands, `sudo` when the login is not root, a full upgrade (plus Flatpak or snap when those are installed) when asked to bring a machine up to date, and a look at devices and logs before changing anything.
 
 On the first successful SSH connection Steward records the server host key. If that key changes later, Steward refuses to connect.
 
@@ -127,6 +131,8 @@ Two things still stop for a person, in every mode:
 - Commands Steward classifies as destructive (`rm -rf`, `mkfs`, `dd`, disk redirects, `curl | bash`, force-push, package removal, and similar).
 - Anything that uses `sudo`, because the password has to come from you. In full-auto this is only the password prompt. The password is reused for later sudo commands in the same turn, then dropped. A rejected password is not reused.
 
+If a command fails with a permission error, the tool result tells the agent to retry once with `sudo`. That retry still goes through approval. The password is still never written down.
+
 The classifier is a heuristic, not a sandbox. The dialog shows the exact string that will run. Read-only detection understands common inspection commands (`ls`, `cat`, `df`, `systemctl status`, `git status`, `apt list`, pipelines of those, and so on). Anything it does not recognize is treated as a change.
 
 ## Memory
@@ -136,14 +142,14 @@ Each agent has its own SQLite notes. The system prompt for every turn includes t
 You can edit that memory yourself:
 
 ```bash
-steward notes list --agent House
-steward notes add --agent House --title Coffee --content "Black, in the morning."
-steward notes search --agent House coffee
-steward notes edit 1 --agent House --content "Black coffee, no sugar."
-steward notes delete 1 --agent House
+steward notes list --agent <agent>
+steward notes add --agent <agent> --title Coffee --content "Black, in the morning."
+steward notes search --agent <agent> coffee
+steward notes edit 1 --agent <agent> --content "Black coffee, no sugar."
+steward notes delete 1 --agent <agent>
 ```
 
-The same list is in the window, under **Notes**. Conversation history is separate from notes. `steward agents clear-history House` drops the transcript and the tool log and keeps the notes.
+The same list is in the window, under **Notes**. Conversation history is separate from notes. `steward agents clear-history <agent>` drops the transcript and the tool log and keeps the notes.
 
 Keyword search is the implementation that ships. `memory.backend` in the config is the hook for a later embedding index (Ollama `/api/embeddings`). Unknown values stay on keywords.
 
@@ -206,7 +212,8 @@ The tests cover approval decisions, the SQLite store, local commands, SSH comman
 
 - Destructive-command detection is deliberately cautious and will sometimes ask about a harmless line. It will also miss a destructive action hidden in a novel way. Read the command before you approve it.
 - `doas` is recognized as privileged, but a password is only injected for `sudo`.
-- File tools over SSH run as the login user. Writing a root-owned file means a `sudo` shell command, which goes through approval.
+- File tools run as the login user. Writing a root-owned file means a `sudo` shell command, which goes through approval.
+- There is no built-in machine. Until you add one, including this computer, the agent cannot run commands or read files.
 - Very large command output is truncated before it is stored and sent back to the model.
 - Stopping a turn kills a local process. A remote command is closed as soon as the SSH session drops, which is not always instant.
 - There is no account system. Anyone who can run Steward as you can drive your machines, subject to the approval mode of the agent.
