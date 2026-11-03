@@ -1,7 +1,8 @@
-"""Read, write, and list files on local or a named SSH machine."""
+"""Read, write, and list files on a saved machine."""
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,7 @@ from typing import Any
 from steward.core.approval import path_is_sensitive
 from steward.core.errors import StewardError
 from steward.core.execution import list_remote_directory, read_remote_bytes, write_remote_bytes
+from steward.core.machines import resolve_machine
 from steward.core.models import CommandAssessment
 from steward.core.tools.base import Tool, ToolContext
 
@@ -19,12 +21,12 @@ _MAX_ENTRIES = 400
 
 class ReadFileTool(Tool):
     name = "read_file"
-    description = "Read a text file from local or a named machine. Binary files are reported but not dumped."
+    description = "Read a text file on a saved machine. Binary files are reported but not dumped."
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "File path. ~ is the home directory of the target machine."},
-            "machine": {"type": "string", "description": "Machine name, or local. Defaults to local."},
+            "machine": {"type": "string", "description": "Saved machine name. Omit only when one machine is configured."},
         },
         "required": ["path"],
     }
@@ -34,31 +36,30 @@ class ReadFileTool(Tool):
         path = _path_arg(arguments)
         if path is None:
             return "Error: path is required."
-        machine_name = str(arguments.get("machine") or "local")
         try:
-            if machine_name.lower() == "local":
+            machine = resolve_machine(context.store, arguments.get("machine"))
+            if machine.is_local:
                 return _read_local(path)
-            machine = _machine(context, machine_name)
             data = read_remote_bytes(machine, context.store, path, _MAX_READ + 1)
         except StewardError as exc:
             return f"Error: {exc}"
         except OSError as exc:
-            return f"Error: {exc}"
+            return _format_os_error(exc)
         return _render_bytes(data, path)
 
 
 class WriteFileTool(Tool):
     name = "write_file"
     description = (
-        "Write a text file on local or a named machine, replacing the file if it exists. "
-        "Parent directories are created. This runs as the SSH user, not as root."
+        "Write a text file on a saved machine, replacing the file if it exists. "
+        "Parent directories are created. This runs as the login user, not as root."
     )
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string"},
             "content": {"type": "string", "description": "The full new contents of the file."},
-            "machine": {"type": "string", "description": "Machine name, or local. Defaults to local."},
+            "machine": {"type": "string", "description": "Saved machine name. Omit only when one machine is configured."},
         },
         "required": ["path", "content"],
     }
@@ -66,7 +67,7 @@ class WriteFileTool(Tool):
 
     def classify(self, arguments: dict[str, Any]) -> CommandAssessment:
         path = str(arguments.get("path") or "")
-        remote = str(arguments.get("machine") or "local").lower() != "local"
+        remote = bool(str(arguments.get("machine") or "").strip())
         if path_is_sensitive(path, remote=remote):
             return CommandAssessment("destructive", False, ("sensitive path",))
         return CommandAssessment("mutating", False, ())
@@ -80,32 +81,31 @@ class WriteFileTool(Tool):
         content = arguments["content"]
         if len(content.encode("utf-8")) > _MAX_WRITE:
             return f"Error: refusing to write more than {_MAX_WRITE} bytes."
-        machine_name = str(arguments.get("machine") or "local")
         try:
-            if machine_name.lower() == "local":
+            machine = resolve_machine(context.store, arguments.get("machine"))
+            if machine.is_local:
                 target = Path(path).expanduser()
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
                 return f"Wrote {len(content)} characters to {target}."
-            machine = _machine(context, machine_name)
             written = write_remote_bytes(
                 machine, context.store, path, content.encode("utf-8"), True
             )
         except StewardError as exc:
             return f"Error: {exc}"
         except OSError as exc:
-            return f"Error: {exc}"
+            return _format_os_error(exc)
         return f"Wrote {len(content)} characters to {written} on {machine.name}."
 
 
 class ListDirectoryTool(Tool):
     name = "list_directory"
-    description = "List files and directories at a path on local or a named machine."
+    description = "List files and directories at a path on a saved machine."
     parameters = {
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "Directory path. Defaults to the home directory."},
-            "machine": {"type": "string", "description": "Machine name, or local. Defaults to local."},
+            "machine": {"type": "string", "description": "Saved machine name. Omit only when one machine is configured."},
         },
         "required": ["path"],
     }
@@ -113,16 +113,15 @@ class ListDirectoryTool(Tool):
 
     def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         path = _path_arg(arguments) or "~"
-        machine_name = str(arguments.get("machine") or "local")
         try:
-            if machine_name.lower() == "local":
+            machine = resolve_machine(context.store, arguments.get("machine"))
+            if machine.is_local:
                 return _list_local(path)
-            machine = _machine(context, machine_name)
             entries = list_remote_directory(machine, context.store, path)
         except StewardError as exc:
             return f"Error: {exc}"
         except OSError as exc:
-            return f"Error: {exc}"
+            return _format_os_error(exc)
         return _render_entries(path, entries)
 
 
@@ -133,14 +132,6 @@ def _path_arg(arguments: dict[str, Any]) -> str | None:
     return path.strip()
 
 
-def _machine(context: ToolContext, name: str):
-    machine = context.store.get_machine(name)
-    if machine is None:
-        known = ", ".join(["local", *[item.name for item in context.store.list_machines()]])
-        raise StewardError(f"unknown machine '{name}'. Known machines: {known}.")
-    return machine
-
-
 def _read_local(path: str) -> str:
     target = Path(path).expanduser()
     if target.is_dir():
@@ -148,7 +139,7 @@ def _read_local(path: str) -> str:
     try:
         data = target.read_bytes()
     except OSError as exc:
-        return f"Error: {exc}"
+        return _format_os_error(exc)
     if len(data) > _MAX_READ:
         data = data[: _MAX_READ + 1]
     return _render_bytes(data, str(target))
@@ -170,6 +161,17 @@ def _list_local(path: str) -> str:
                 kind, size = "file", 0
             entries.append((item.name, kind, size))
     return _render_entries(str(target), entries)
+
+
+def _format_os_error(exc: OSError) -> str:
+    text = f"Error: {exc}"
+    if exc.errno in (errno.EACCES, errno.EPERM):
+        return (
+            text
+            + " Hint: permission denied. File tools cannot sudo. "
+            + "Retry with run_command using sudo if this needs root. Steward will ask for approval."
+        )
+    return text
 
 
 def _render_bytes(data: bytes, label: str) -> str:

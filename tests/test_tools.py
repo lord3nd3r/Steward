@@ -46,6 +46,7 @@ def test_local_command_and_files(tmp_path):
 
     registry = default_registry()
     store = Store()
+    store.upsert_machine(Machine(name="box", is_local=True))
     context = ToolContext(agent_id="x", store=store, settings=Settings())
     folder = tmp_path / "notes"
     text = registry.get("run_command").execute(
@@ -66,8 +67,8 @@ def test_local_command_and_files(tmp_path):
     listing = registry.get("list_directory").execute({"path": str(folder)}, context)
     assert "a.txt" in listing
 
-    missing = registry.get("run_command").execute({"command": "true", "machine": "SER"}, context)
-    assert "unknown machine" in missing
+    missing = registry.get("run_command").execute({"command": "true", "machine": "missing"}, context)
+    assert "Unknown machine" in missing
 
 
 def test_sensitive_write_is_destructive():

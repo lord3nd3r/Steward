@@ -26,8 +26,13 @@ class ToolRegistry:
     def names(self) -> list[str]:
         return sorted(self._tools)
 
-    def schemas(self) -> list[dict]:
-        return [self._tools[name].schema() for name in self.names()]
+    def schemas(self, *, include_machine_tools: bool = True) -> list[dict]:
+        from steward.core.messages import MACHINE_TOOLS
+
+        names = self.names()
+        if not include_machine_tools:
+            names = [name for name in names if name not in MACHINE_TOOLS]
+        return [self._tools[name].schema() for name in names]
 
     def load_entry_points(self) -> None:
         if os.environ.get("STEWARD_DISABLE_PLUGINS") == "1":

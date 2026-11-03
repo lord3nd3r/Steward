@@ -30,57 +30,58 @@ def main() -> None:
         steward.store.delete_machine(machine.name)
 
     house = steward.store.create_agent(
-        "House",
-        model="llama3.1",
+        "Agent",
+        model="model",
         backend="ollama",
-        persona="Looks after the Linux machines on this network. Checks before changing anything, and keeps notes on how the house is set up.",
+        persona="Looks after the machines on this network. Checks before changing anything.",
         approval_mode="ask",
         max_steps=12,
     )
     steward.store.create_agent(
-        "Workshop",
-        model="qwen2.5-coder",
+        "Other",
+        model="model",
         backend="llama_cpp",
-        persona="Helps with the local code and the machines it builds on.",
+        persona="Helps with code and the machines it builds on.",
         approval_mode="auto_readonly",
     )
+    steward.store.upsert_machine(Machine(name="box", is_local=True))
     steward.store.upsert_machine(
         Machine(
-            name="SER",
-            host="ser.local",
-            user="ada",
-            sudo_notes="Password required. User is in the sudo group.",
+            name="host",
+            host="host.example",
+            user="user",
+            sudo_notes="Password required. The user is in the sudo group.",
         )
     )
     steward.store.save_note(house.id, "Coffee", "Likes black coffee in the morning, no sugar.", "food")
-    steward.store.save_note(house.id, "SER", "SER is the living-room server, ada@ser.local. Updates happen on Sunday.", "machines")
+    steward.store.save_note(house.id, "host", "host is user@host.example. Updates happen on Sunday.", "machines")
 
-    steward.store.add_message(house.id, "user", "Is SER fully up to date? The webcam on this machine also dropped out after the last kernel update.")
+    steward.store.add_message(house.id, "user", "Is host fully up to date? The webcam on this machine also dropped out after the last kernel update.")
     steward.store.add_message(
         house.id,
         "assistant",
-        "I'll check SER's package list first, then look at the webcam on this machine.",
+        "I'll check the package list on host first, then look at the webcam on this computer.",
     )
     steward.store.add_tool_event(
         house.id,
         "run_command",
-        {"command": "apt list --upgradable", "machine": "SER"},
+        {"command": "apt list --upgradable", "machine": "host"},
         "exit_code: 0\nstdout:\nlinux-image-generic/noble-updates 6.8.0-51 amd64 [upgradable from: 6.8.0-48]\nfwupd/noble-updates 1.9.26 amd64 [upgradable from: 1.9.16]",
-        machine="SER",
+        machine="host",
         approved=True,
         destructive=False,
     )
     steward.store.add_message(
         house.id,
         "assistant",
-        "SER is behind by a kernel and fwupd. I have not upgraded it yet.\n\nOn this machine the webcam is present on the USB bus, but `uvcvideo` is not loaded. I can load it if you want.\n\nI also noted that you take your coffee black.",
+        "host is behind by a kernel and fwupd. I have not upgraded it yet.\n\nOn this computer the webcam is present on the USB bus, but `uvcvideo` is not loaded. I can load it if you want.\n\nI also noted that you take your coffee black.",
     )
     steward.store.add_tool_event(
         house.id,
         "run_command",
-        {"command": "lsusb; lsmod | grep uvc", "machine": "local"},
+        {"command": "lsusb; lsmod | grep uvc", "machine": "box"},
         "exit_code: 0\nstdout:\nBus 002 Device 004: ID 046d:0825 Logitech, Inc. Webcam C270\n(no uvcvideo module)",
-        machine="local",
+        machine="box",
         approved=True,
         destructive=False,
     )
@@ -107,8 +108,8 @@ def main() -> None:
     dialog = ApprovalDialog(
         ApprovalRequest(
             tool_name="run_command",
-            arguments={"command": "sudo apt update && sudo apt upgrade -y", "machine": "SER"},
-            machine="SER",
+            arguments={"command": "sudo apt update && sudo apt upgrade -y", "machine": "host"},
+            machine="host",
             summary="sudo apt update && sudo apt upgrade -y",
             reason="This agent is set to ask before every action.",
             destructive=False,

@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from steward.core.approval import needs_human_approval, scrub_secret
 from steward.core.display import summarize_action
 from steward.core.errors import Cancelled, StewardError, ToolUnsupportedError
+from steward.core.facts import ensure_machine_facts
 from steward.core.llm.base import ChatMessage, LLMBackend, LLMResponse
+from steward.core.messages import MACHINE_TOOLS, NO_MACHINES_MESSAGE
 from steward.core.llm.fallback import apply_text_tool_calls
 from steward.core.models import Agent, ApprovalDecision, ApprovalRequest, ToolCall, TurnResult
 from steward.core.prompts import build_system_prompt
@@ -64,7 +66,11 @@ class AgentRunner:
         agent = self.store.require_agent(agent_id)
         self.store.add_message(agent.id, "user", text)
         notes = self.store.relevant_notes(agent.id, text)
-        system = build_system_prompt(agent, notes, self.store.list_machines())
+        try:
+            facts = ensure_machine_facts(self.store, on_status=on_status, cancel=cancel)
+        except Cancelled:
+            return TurnResult("", 0, cancelled=True)
+        system = build_system_prompt(agent, notes, self.store.list_machines(), facts)
         history = self.store.recent_messages(agent.id, limit=self.settings.history_limit)
         messages: list[ChatMessage] = [ChatMessage("system", system)]
         messages.extend(_to_chat(item) for item in history)
@@ -153,7 +159,9 @@ class AgentRunner:
     ) -> LLMResponse:
         backend = self.backend_factory(self.settings, agent)
         outbound = _flatten_for_text(messages) if text_mode else messages
-        tools = None if text_mode else self.registry.schemas()
+        tools = None if text_mode else self.registry.schemas(
+            include_machine_tools=bool(self.store.list_machines())
+        )
         return backend.complete(outbound, tools, on_token=on_token, cancel=cancel)
 
     def _run_tool(
@@ -175,6 +183,21 @@ class AgentRunner:
             result = f"Error: unknown tool '{call.name}'. Available tools: {', '.join(self.registry.names())}."
             event = self.store.add_tool_event(
                 agent.id, call.name, arguments, result, machine=machine, approved=False, destructive=False
+            )
+            if on_tool:
+                on_tool(event)
+            return result, False
+
+        if tool.name in MACHINE_TOOLS and not self.store.list_machines():
+            result = NO_MACHINES_MESSAGE
+            event = self.store.add_tool_event(
+                agent.id,
+                tool.name,
+                arguments,
+                result,
+                machine=machine,
+                approved=False,
+                destructive=False,
             )
             if on_tool:
                 on_tool(event)

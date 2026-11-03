@@ -23,12 +23,19 @@ def test_cli_agent_machine_and_note_flow():
 
     added = runner.invoke(
         app,
-        ["machines", "add", "SER", "--host", "ser.local", "--user", "ada", "--sudo-notes", "password required"],
+        ["machines", "add", "host", "--host", "host.example", "--user", "user", "--sudo-notes", "password required"],
     )
     assert added.exit_code == 0, added.stdout
     machines = runner.invoke(app, ["machines", "list"])
-    assert "SER" in machines.stdout
-    assert "local" in machines.stdout
+    assert "host" in machines.stdout
+    assert "host.example" in machines.stdout
+    here = runner.invoke(app, ["machines", "add", "box", "--local"])
+    assert here.exit_code == 0, here.stdout
+    listed = runner.invoke(app, ["machines", "list"])
+    assert "this computer" in listed.stdout
+    second = runner.invoke(app, ["machines", "add", "other", "--local"])
+    assert second.exit_code == 1
+    assert "already saved" in second.stdout
 
     note = runner.invoke(
         app,
@@ -41,3 +48,18 @@ def test_cli_agent_machine_and_note_flow():
     missing = runner.invoke(app, ["ask", "--agent", "Nobody", "hello"])
     assert missing.exit_code == 1
     assert "No agent" in missing.stdout
+
+
+def test_fresh_cli_invites_the_first_agent_and_this_computer():
+    bare = runner.invoke(app, [])
+    assert bare.exit_code == 0, bare.stdout
+    flat = " ".join(bare.stdout.split())
+    assert "Create your first agent with: steward agents create --name <name> --model <model>" in flat
+    assert "steward machines add <name> --local" in flat
+    agents = runner.invoke(app, ["agents", "list"])
+    assert agents.exit_code == 0
+    assert "No agents yet" in agents.stdout
+    machines = runner.invoke(app, ["machines", "list"])
+    assert machines.exit_code == 0
+    assert "steward machines add <name> --local" in " ".join(machines.stdout.split())
+    assert "box" not in machines.stdout

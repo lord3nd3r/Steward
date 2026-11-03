@@ -12,13 +12,14 @@ from typing import Any
 
 from steward.core.errors import StewardError
 from steward.core.memory_index import get_memory_index
+from steward.core.messages import NO_AGENTS_MESSAGE
 from steward.core.models import (
     APPROVAL_MODES,
     BACKENDS,
-    DEFAULT_PERSONA,
     TOOL_PROTOCOLS,
     Agent,
     Machine,
+    MachineFacts,
     Note,
     StoredMessage,
     ToolCall,
@@ -51,7 +52,8 @@ CREATE TABLE IF NOT EXISTS machines (
     identity_file TEXT,
     sudo_notes TEXT NOT NULL DEFAULT '',
     use_agent INTEGER NOT NULL DEFAULT 1,
-    host_key_fingerprint TEXT NOT NULL DEFAULT ''
+    host_key_fingerprint TEXT NOT NULL DEFAULT '',
+    is_local INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -87,6 +89,19 @@ CREATE TABLE IF NOT EXISTS tool_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS machine_facts (
+    machine TEXT PRIMARY KEY COLLATE NOCASE,
+    user_name TEXT NOT NULL DEFAULT '',
+    is_root INTEGER NOT NULL DEFAULT 0,
+    os_id TEXT NOT NULL DEFAULT '',
+    os_version TEXT NOT NULL DEFAULT '',
+    pkg TEXT NOT NULL DEFAULT '',
+    sudo_state TEXT NOT NULL DEFAULT '',
+    extras TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    gathered_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_notes_agent ON notes(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_agent ON tool_events(agent_id, id);
@@ -105,6 +120,7 @@ class Store:
         with self._lock:
             with self._connect() as conn:
                 conn.executescript(_SCHEMA)
+                _migrate(conn)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -150,7 +166,7 @@ class Store:
         steps = max(1, min(40, int(steps)))
         now = utcnow()
         agent_id = uuid.uuid4().hex
-        persona = persona.strip() or DEFAULT_PERSONA
+        persona = persona.strip()
         try:
             with self._lock, self._connect() as conn:
                 conn.execute(
@@ -182,7 +198,7 @@ class Store:
         if unknown:
             raise StewardError(f"Cannot update {', '.join(sorted(unknown))}.")
         name = _validate_name(fields.get("name", current.name), "Agent name")
-        persona = str(fields.get("persona", current.persona)).strip() or DEFAULT_PERSONA
+        persona = str(fields.get("persona", current.persona)).strip()
         backend = _validate_choice(fields.get("backend", current.backend), BACKENDS, "backend")
         approval_mode = _validate_choice(
             fields.get("approval_mode", current.approval_mode), APPROVAL_MODES, "approval mode"
@@ -228,7 +244,12 @@ class Store:
     def require_agent(self, id_or_name: str) -> Agent:
         agent = self.get_agent(id_or_name)
         if agent is None:
-            raise StewardError(f"No agent named {id_or_name}. Create one with `steward agents create`.")
+            if not self.list_agents():
+                raise StewardError(NO_AGENTS_MESSAGE)
+            raise StewardError(
+                f"No agent named {id_or_name}. "
+                "Create one with: steward agents create --name <name> --model <model>"
+            )
         return agent
 
     # ----- machines -------------------------------------------------------
@@ -239,8 +260,6 @@ class Store:
         return [_machine(row) for row in rows]
 
     def get_machine(self, name: str) -> Machine | None:
-        if name.lower() == "local":
-            return None
         with self._lock, self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM machines WHERE name = ? COLLATE NOCASE", (name,)
@@ -248,16 +267,42 @@ class Store:
         return _machine(row) if row else None
 
     def upsert_machine(self, machine: Machine) -> Machine:
+        import getpass
+
         name = _validate_name(machine.name, "Machine name")
-        if name.lower() == "local":
-            raise StewardError('"local" is the machine Steward is running on. Pick another name.')
-        if not machine.host.strip() or not machine.user.strip():
-            raise StewardError("A machine needs a host and a user.")
-        port = int(machine.port)
-        if port < 1 or port > 65535:
-            raise StewardError("SSH port must be between 1 and 65535.")
-        identity = machine.identity_file.strip() if machine.identity_file else None
+        if machine.is_local:
+            host = ""
+            try:
+                user = getpass.getuser() or ""
+            except Exception:
+                user = ""
+            port = 0
+            identity = None
+            use_agent = 0
+        else:
+            host = machine.host.strip()
+            user = machine.user.strip()
+            if not host or not user:
+                raise StewardError(
+                    "An SSH machine needs a host and a user. "
+                    "For this computer: steward machines add <name> --local"
+                )
+            port = int(machine.port)
+            if port < 1 or port > 65535:
+                raise StewardError("SSH port must be between 1 and 65535.")
+            identity = machine.identity_file.strip() if machine.identity_file else None
+            use_agent = 1 if machine.use_agent else 0
         with self._lock, self._connect() as conn:
+            if machine.is_local:
+                other = conn.execute(
+                    "SELECT name FROM machines WHERE is_local = 1 AND name != ? COLLATE NOCASE",
+                    (name,),
+                ).fetchone()
+                if other is not None:
+                    raise StewardError(
+                        f"This computer is already saved as {other['name']}. "
+                        "Edit that machine, or remove it first."
+                    )
             existing = conn.execute(
                 "SELECT host_key_fingerprint FROM machines WHERE name = ? COLLATE NOCASE",
                 (name,),
@@ -265,35 +310,87 @@ class Store:
             fingerprint = machine.host_key_fingerprint
             if existing and not fingerprint:
                 fingerprint = existing["host_key_fingerprint"]
+            previous = conn.execute(
+                "SELECT host, user, port, is_local FROM machines WHERE name = ? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
             conn.execute("DELETE FROM machines WHERE name = ? COLLATE NOCASE", (name,))
             conn.execute(
                 """
                 INSERT INTO machines (
-                    name, host, user, port, identity_file, sudo_notes, use_agent, host_key_fingerprint
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    name, host, user, port, identity_file, sudo_notes, use_agent,
+                    host_key_fingerprint, is_local
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
-                    machine.host.strip(),
-                    machine.user.strip(),
+                    host,
+                    user,
                     port,
                     identity,
                     machine.sudo_notes.strip(),
-                    1 if machine.use_agent else 0,
+                    use_agent,
                     fingerprint or "",
+                    1 if machine.is_local else 0,
                 ),
             )
+            changed = previous is not None and (
+                previous["host"] != host
+                or previous["user"] != user
+                or int(previous["port"]) != port
+                or bool(previous["is_local"]) != bool(machine.is_local)
+            )
+            if changed:
+                conn.execute(
+                    "DELETE FROM machine_facts WHERE machine = ? COLLATE NOCASE",
+                    (name,),
+                )
         stored = self.get_machine(name)
         assert stored is not None
         return stored
 
     def delete_machine(self, name: str) -> None:
-        if name.lower() == "local":
-            raise StewardError('"local" is always available and cannot be removed.')
         if self.get_machine(name) is None:
             raise StewardError(f"No machine named {name}.")
         with self._lock, self._connect() as conn:
             conn.execute("DELETE FROM machines WHERE name = ? COLLATE NOCASE", (name,))
+            conn.execute("DELETE FROM machine_facts WHERE machine = ? COLLATE NOCASE", (name,))
+
+    def get_facts(self, name: str) -> MachineFacts | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM machine_facts WHERE machine = ? COLLATE NOCASE",
+                (name,),
+            ).fetchone()
+        return _facts(row) if row else None
+
+    def save_facts(self, facts: MachineFacts) -> None:
+        name = facts.machine.strip()
+        if not name:
+            raise StewardError("Machine facts need a machine name.")
+        error = " ".join(facts.error.split())[:180]
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM machine_facts WHERE machine = ? COLLATE NOCASE", (name,))
+            conn.execute(
+                """
+                INSERT INTO machine_facts (
+                    machine, user_name, is_root, os_id, os_version, pkg, sudo_state,
+                    extras, error, gathered_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    name,
+                    facts.user_name.strip(),
+                    1 if facts.is_root else 0,
+                    facts.os_id.strip(),
+                    facts.os_version.strip(),
+                    facts.pkg.strip(),
+                    facts.sudo_state.strip(),
+                    facts.extras.strip(),
+                    error,
+                    facts.gathered_at or utcnow(),
+                ),
+            )
 
     def set_host_key_fingerprint(self, name: str, fingerprint: str) -> None:
         with self._lock, self._connect() as conn:
@@ -498,6 +595,15 @@ class Store:
         return [_event(row) for row in reversed(rows)]
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+    if "machines" not in tables:
+        return
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(machines)")}
+    if "is_local" not in columns:
+        conn.execute("ALTER TABLE machines ADD COLUMN is_local INTEGER NOT NULL DEFAULT 0")
+
+
 def _validate_name(name: str, label: str) -> str:
     clean = " ".join(name.strip().split())
     if not _NAME_OK.match(clean):
@@ -537,6 +643,21 @@ def _agent(row: sqlite3.Row) -> Agent:
     )
 
 
+def _facts(row: sqlite3.Row) -> MachineFacts:
+    return MachineFacts(
+        machine=row["machine"],
+        user_name=row["user_name"],
+        is_root=bool(row["is_root"]),
+        os_id=row["os_id"],
+        os_version=row["os_version"],
+        pkg=row["pkg"],
+        sudo_state=row["sudo_state"],
+        extras=row["extras"],
+        error=row["error"],
+        gathered_at=row["gathered_at"],
+    )
+
+
 def _machine(row: sqlite3.Row) -> Machine:
     return Machine(
         name=row["name"],
@@ -547,6 +668,7 @@ def _machine(row: sqlite3.Row) -> Machine:
         sudo_notes=row["sudo_notes"],
         use_agent=bool(row["use_agent"]),
         host_key_fingerprint=row["host_key_fingerprint"],
+        is_local=bool(row["is_local"]) if "is_local" in row.keys() else False,
     )
 
 

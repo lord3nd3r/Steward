@@ -21,13 +21,6 @@ BACKEND_LABELS = {
     "llama_cpp": "llama.cpp",
 }
 
-DEFAULT_PERSONA = (
-    "You are a careful steward of the user's Linux machines. "
-    "You investigate before you change anything, you explain what you found, "
-    "and you remember stable preferences and facts."
-)
-
-
 @dataclass
 class Agent:
     id: str
@@ -45,13 +38,34 @@ class Agent:
 @dataclass
 class Machine:
     name: str
-    host: str
-    user: str
+    host: str = ""
+    user: str = ""
     port: int = 22
     identity_file: str | None = None
     sudo_notes: str = ""
     use_agent: bool = True
     host_key_fingerprint: str = ""
+    is_local: bool = False
+
+
+@dataclass
+class MachineFacts:
+    """Cached read-only facts about a saved machine.
+
+    Free-text fields from the host are not copied into the system prompt.
+    ``fact_line`` keeps only short allowlisted tokens.
+    """
+
+    machine: str
+    user_name: str = ""
+    is_root: bool = False
+    os_id: str = ""
+    os_version: str = ""
+    pkg: str = ""
+    sudo_state: str = ""  # root | sudo | doas | none
+    extras: str = ""  # comma-separated: flatpak, snap
+    error: str = ""
+    gathered_at: str = ""
 
 
 @dataclass

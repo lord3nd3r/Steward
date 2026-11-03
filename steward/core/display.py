@@ -10,7 +10,7 @@ def summarize_action(tool_name: str, arguments: dict[str, Any]) -> tuple[str, st
     """Return ``(machine, summary)`` for an approval dialog or activity row."""
     machine = str(arguments.get("machine") or "")
     if tool_name in {"run_command", "read_file", "write_file", "list_directory"}:
-        machine = machine or "local"
+        machine = machine or "unspecified"
     else:
         machine = machine or "memory"
 

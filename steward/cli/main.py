@@ -16,6 +16,8 @@ from rich.text import Text
 
 from steward import __version__
 from steward.core.errors import StewardError
+from steward.core.facts import describe, fact_line, refresh_machine_facts
+from steward.core.messages import NO_AGENTS_MESSAGE, NO_MACHINES_MESSAGE
 from steward.core.llm.base import list_backend_models
 from steward.core.models import (
     APPROVAL_LABELS,
@@ -28,9 +30,17 @@ from steward.core.paths import config_path, database_path
 from steward.core.service import open_steward
 
 console = Console(highlight=False)
-app = typer.Typer(add_completion=False, no_args_is_help=True, help="Local multi-agent assistant. Models stay on your machines.")
-agents_app = typer.Typer(no_args_is_help=True, help="Create and manage agents.")
-machines_app = typer.Typer(no_args_is_help=True, help="Machines an agent can reach over SSH. local is always available.")
+app = typer.Typer(
+    add_completion=False,
+    no_args_is_help=False,
+    invoke_without_command=True,
+    help="Local multi-agent assistant. Models stay on your machines.",
+)
+agents_app = typer.Typer(no_args_is_help=True, help="Create and manage agents. A new install has none.")
+machines_app = typer.Typer(
+    no_args_is_help=True,
+    help="Machines you add yourself, including this computer: steward machines add <name> --local",
+)
 notes_app = typer.Typer(no_args_is_help=True, help="Read and edit an agent's memory.")
 app.add_typer(agents_app, name="agents")
 app.add_typer(machines_app, name="machines")
@@ -58,15 +68,18 @@ def _version(value: bool) -> None:
         raise typer.Exit()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
 def _root(
+    ctx: typer.Context,
     version: bool = typer.Option(False, "--version", help="Show the version and exit.", callback=_version, is_eager=True),
 ) -> None:
-    """Local multi-agent assistant."""
+    """Local multi-agent assistant. A new install has no agents and no machines."""
     if os.environ.get("STEWARD_DEBUG"):
         import logging
 
         logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
+    if ctx.invoked_subcommand is None:
+        _print_empty_state(open_steward())
 
 
 @app.command("gui")
@@ -84,6 +97,8 @@ def chat(agent: str = typer.Option(..., "--agent", "-a", help="Agent name.")) ->
     """Talk to an agent. The agent can run tools between replies."""
     steward = open_steward()
     record = steward.store.require_agent(agent)
+    if not steward.store.list_machines():
+        console.print(f"[yellow]{NO_MACHINES_MESSAGE}[/yellow]")
     console.print(
         f"[bold]{record.name}[/bold]  "
         f"[dim]{BACKEND_LABELS.get(record.backend, record.backend)} · {record.model} · "
@@ -129,6 +144,8 @@ def ask(
     """One turn: send a prompt, approve any actions, print the answer."""
     steward = open_steward()
     record = steward.store.require_agent(agent)
+    if not steward.store.list_machines():
+        console.print(NO_MACHINES_MESSAGE)
     _run_turn(steward, record.id, prompt)
 
 
@@ -139,7 +156,7 @@ def agents_list() -> None:
     steward = open_steward()
     rows = steward.store.list_agents()
     if not rows:
-        console.print("No agents yet. Create one with [bold]steward agents create[/bold].")
+        console.print(NO_AGENTS_MESSAGE)
         return
     table = Table(title="Agents")
     table.add_column("Name")
@@ -249,19 +266,29 @@ def agents_clear_history(
 @machines_app.command("list")
 @guarded
 def machines_list() -> None:
-    """List machines. local is this computer."""
+    """List machines you have added. Nothing is included automatically."""
     steward = open_steward()
+    if not steward.store.list_machines():
+        console.print(NO_MACHINES_MESSAGE)
+        return
     table = Table(title="Machines")
     table.add_column("Name")
     table.add_column("Target")
     table.add_column("Key")
+    table.add_column("Facts")
     table.add_column("Sudo notes")
-    table.add_row("local", "this computer", "—", "—")
     for machine in steward.store.list_machines():
+        if machine.is_local:
+            target = "this computer"
+            key = "—"
+        else:
+            target = f"{machine.user}@{machine.host}:{machine.port}"
+            key = machine.identity_file or ("ssh-agent" if machine.use_agent else "default keys")
         table.add_row(
             machine.name,
-            f"{machine.user}@{machine.host}:{machine.port}",
-            machine.identity_file or ("ssh-agent" if machine.use_agent else "default keys"),
+            target,
+            key,
+            _cached_facts(steward, machine.name),
             machine.sudo_notes,
         )
     console.print(table)
@@ -270,15 +297,16 @@ def machines_list() -> None:
 @machines_app.command("add")
 @guarded
 def machines_add(
-    name: str = typer.Argument(..., help="Short name, for example SER."),
-    host: str = typer.Option(..., "--host", prompt=True),
-    user: str = typer.Option(..., "--user", prompt=True),
+    name: str = typer.Argument(..., help="Name you choose."),
+    local: bool = typer.Option(False, "--local", help="This computer. No SSH host."),
+    host: str = typer.Option("", "--host"),
+    user: str = typer.Option("", "--user"),
     port: int = typer.Option(22, "--port"),
     identity_file: str = typer.Option("", "--identity-file", help="Private key path. Leave empty to use ssh-agent."),
     sudo_notes: str = typer.Option("", "--sudo-notes", help="How sudo works here. Do not put the password."),
     no_agent: bool = typer.Option(False, "--no-agent", help="Do not use ssh-agent."),
 ) -> None:
-    """Add or update a machine. The host key is pinned on the first successful SSH."""
+    """Add or update a machine. Use --local for this computer."""
     machine = Machine(
         name=name,
         host=host,
@@ -287,9 +315,13 @@ def machines_add(
         identity_file=identity_file or None,
         sudo_notes=sudo_notes,
         use_agent=not no_agent,
+        is_local=local,
     )
     stored = open_steward().store.upsert_machine(machine)
-    console.print(f"Saved [bold]{stored.name}[/bold] ({stored.user}@{stored.host}:{stored.port}).")
+    if stored.is_local:
+        console.print(f"Saved [bold]{stored.name}[/bold] (this computer).")
+    else:
+        console.print(f"Saved [bold]{stored.name}[/bold] ({stored.user}@{stored.host}:{stored.port}).")
 
 
 @machines_app.command("remove")
@@ -303,6 +335,24 @@ def machines_remove(
         typer.confirm(f"Remove {name} from Steward?", abort=True)
     open_steward().store.delete_machine(name)
     console.print(f"Removed {name}.")
+
+
+@machines_app.command("refresh")
+@guarded
+def machines_refresh(
+    name: str | None = typer.Argument(None, help="Machine name. Omit to refresh every saved machine."),
+) -> None:
+    """Re-read distro, package manager, and sudo facts. They are cached until the next refresh."""
+    found = refresh_machine_facts(open_steward().store, name)
+    for item in found:
+        console.print(describe(item))
+
+
+def _cached_facts(steward, name: str) -> str:
+    facts = steward.store.get_facts(name)
+    if facts is None:
+        return "not gathered"
+    return fact_line(facts)
 
 
 @notes_app.command("list")
@@ -410,8 +460,14 @@ def doctor() -> None:
     steward = open_steward()
     console.print(f"Config   {config_path()}")
     console.print(f"Database {database_path()}")
-    console.print(f"Agents   {len(steward.store.list_agents())}")
-    console.print(f"Machines {len(steward.store.list_machines())} plus local")
+    agents = steward.store.list_agents()
+    machines = steward.store.list_machines()
+    console.print(f"Agents   {len(agents)}")
+    if not agents:
+        console.print(NO_AGENTS_MESSAGE)
+    console.print(f"Machines {len(machines)}")
+    if not machines:
+        console.print(NO_MACHINES_MESSAGE)
     _probe("Ollama", steward.settings.ollama_base_url, lambda: list_backend_models(steward.settings, "ollama"))
     _probe("llama.cpp", steward.settings.llama_cpp_base_url, lambda: list_backend_models(steward.settings, "llama_cpp"))
 
@@ -536,6 +592,17 @@ def approve_on_cli(request: ApprovalRequest) -> ApprovalDecision:
             return ApprovalDecision(approved=False)
         password = entered or None
     return ApprovalDecision(approved=True, sudo_password=password)
+
+
+def _print_empty_state(steward) -> None:
+    """First-run text. Printed only when `steward` is started with no command."""
+    agents = steward.store.list_agents()
+    machines = steward.store.list_machines()
+    if not agents:
+        console.print(NO_AGENTS_MESSAGE)
+    if not machines:
+        console.print(NO_MACHINES_MESSAGE)
+    console.print("Use steward --help to see commands.")
 
 
 def main() -> None:

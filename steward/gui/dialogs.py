@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from steward.core.errors import StewardError
+from steward.core.messages import NO_MACHINES_MESSAGE
 from steward.core.llm.base import list_backend_models
 from steward.core.models import (
     APPROVAL_LABELS,
@@ -76,8 +77,6 @@ class AgentDialog(QDialog):
         self.model.setEditable(True)
         if agent:
             self.model.setCurrentText(agent.model)
-        else:
-            self.model.setCurrentText("llama3.1")
         refresh = QPushButton("List models")
         refresh.clicked.connect(self._refresh_models)
         self.model_status = QLabel("")
@@ -305,27 +304,30 @@ class MachineDialog(QDialog):
         self.name = QLineEdit()
         self.host = QLineEdit()
         self.user = QLineEdit()
+        self.this_computer = QCheckBox("This computer")
+        self.this_computer.toggled.connect(self._sync_target)
         self.port = QSpinBox()
         self.port.setRange(1, 65535)
         self.port.setValue(22)
         self.identity = QLineEdit()
-        browse = QPushButton("Browse")
-        browse.clicked.connect(self._browse)
+        self.browse = QPushButton("Browse")
+        self.browse.clicked.connect(self._browse)
         self.use_agent = QCheckBox("Use ssh-agent")
         self.use_agent.setChecked(True)
         self.sudo_notes = QPlainTextEdit()
         self.sudo_notes.setPlaceholderText("How sudo works on this machine. Never write the password.")
         self.sudo_notes.setFixedHeight(70)
-        self.status = QLabel("local is this computer and is always available. A host key is pinned the first time SSH succeeds.")
+        self.status = QLabel("")
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
         identity_row = QWidget()
         identity_layout = QHBoxLayout(identity_row)
         identity_layout.setContentsMargins(0, 0, 0, 0)
         identity_layout.addWidget(self.identity, 1)
-        identity_layout.addWidget(browse)
+        identity_layout.addWidget(self.browse)
         form = QFormLayout()
         form.addRow("Name", self.name)
+        form.addRow("", self.this_computer)
         form.addRow("Host", self.host)
         form.addRow("User", self.user)
         form.addRow("Port", self.port)
@@ -338,13 +340,16 @@ class MachineDialog(QDialog):
         remove = QPushButton("Remove")
         remove.setObjectName("danger")
         remove.clicked.connect(self._remove)
-        test = QPushButton("Test SSH")
-        test.clicked.connect(self._test)
+        self.test_ssh = QPushButton("Test SSH")
+        self.test_ssh.clicked.connect(self._test)
+        refresh = QPushButton("Refresh facts")
+        refresh.clicked.connect(self._refresh_facts)
         new = QPushButton("New")
         new.clicked.connect(self._blank)
         row = QHBoxLayout()
         row.addWidget(new)
-        row.addWidget(test)
+        row.addWidget(self.test_ssh)
+        row.addWidget(refresh)
         row.addStretch(1)
         row.addWidget(remove)
         row.addWidget(save)
@@ -367,18 +372,18 @@ class MachineDialog(QDialog):
 
     def _reload(self) -> None:
         self.list.clear()
-        self.list.addItem("local — this computer")
-        item = self.list.item(0)
-        if item:
-            item.setData(Qt.ItemDataRole.UserRole, None)
-            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
         for machine in self.steward.store.list_machines():
-            self.list.addItem(f"{machine.name}  {machine.user}@{machine.host}")
+            if machine.is_local:
+                label = f"{machine.name}  this computer"
+            else:
+                label = f"{machine.name}  {machine.user}@{machine.host}"
+            self.list.addItem(label)
             self.list.item(self.list.count() - 1).setData(Qt.ItemDataRole.UserRole, machine.name)
 
     def _blank(self) -> None:
         self.list.clearSelection()
         self.name.setText("")
+        self.this_computer.setChecked(False)
         self.host.setText("")
         self.user.setText("")
         self.port.setValue(22)
@@ -386,6 +391,22 @@ class MachineDialog(QDialog):
         self.use_agent.setChecked(True)
         self.sudo_notes.setPlainText("")
         self.name.setReadOnly(False)
+        self._sync_target()
+        self._show_intro()
+
+    def _show_intro(self) -> None:
+        if not self.steward.store.list_machines():
+            self.status.setText(NO_MACHINES_MESSAGE + " Or tick This computer, choose a name, and save.")
+        else:
+            self.status.setText(
+                "Tick This computer for the machine Steward is running on. "
+                "Leave it unticked for an SSH host. A host key is pinned the first time SSH succeeds."
+            )
+
+    def _sync_target(self) -> None:
+        local = self.this_computer.isChecked()
+        for widget in (self.host, self.user, self.port, self.identity, self.browse, self.use_agent, self.test_ssh):
+            widget.setEnabled(not local)
 
     def _load_row(self, row: int) -> None:
         item = self.list.item(row)
@@ -398,12 +419,21 @@ class MachineDialog(QDialog):
         if machine is None:
             return
         self.name.setText(machine.name)
-        self.host.setText(machine.host)
-        self.user.setText(machine.user)
-        self.port.setValue(machine.port)
-        self.identity.setText(machine.identity_file or "")
+        self.this_computer.setChecked(machine.is_local)
+        self.host.setText("" if machine.is_local else machine.host)
+        self.user.setText("" if machine.is_local else machine.user)
+        self.port.setValue(22 if machine.is_local or machine.port < 1 else machine.port)
+        self.identity.setText("" if machine.is_local else (machine.identity_file or ""))
+        self._sync_target()
         self.use_agent.setChecked(machine.use_agent)
         self.sudo_notes.setPlainText(machine.sudo_notes)
+        cached = self.steward.store.get_facts(machine.name)
+        if cached is None:
+            self.status.setText(f"{machine.name}: facts not gathered yet. Use Refresh facts.")
+        else:
+            from steward.core.facts import describe
+
+            self.status.setText(describe(cached))
 
     def _browse(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "SSH private key", "", "Keys (*)")
@@ -411,14 +441,16 @@ class MachineDialog(QDialog):
             self.identity.setText(path)
 
     def _machine_from_form(self) -> Machine:
+        local = self.this_computer.isChecked()
         return Machine(
             name=self.name.text(),
-            host=self.host.text(),
-            user=self.user.text(),
-            port=self.port.value(),
-            identity_file=self.identity.text().strip() or None,
+            host="" if local else self.host.text(),
+            user="" if local else self.user.text(),
+            port=0 if local else self.port.value(),
+            identity_file=None if local else (self.identity.text().strip() or None),
             sudo_notes=self.sudo_notes.toPlainText(),
-            use_agent=self.use_agent.isChecked(),
+            use_agent=False if local else self.use_agent.isChecked(),
+            is_local=local,
         )
 
     def _save(self) -> None:
@@ -454,6 +486,9 @@ class MachineDialog(QDialog):
                 return
 
     def _test(self) -> None:
+        if self.this_computer.isChecked():
+            self.status.setText("This computer does not use SSH. Save it, then refresh facts.")
+            return
         try:
             machine = self.steward.store.upsert_machine(self._machine_from_form())
         except StewardError as exc:
@@ -474,6 +509,25 @@ class MachineDialog(QDialog):
             )
             text = (result.stdout or result.stderr or "").strip()
             return f"exit {result.exit_code}: {text}"
+
+        self._thread = _CallThread(attempt)
+        self._thread.ok.connect(lambda text: self.status.setText(str(text)))
+        self._thread.err.connect(lambda text: self.status.setText(str(text)))
+        self._thread.start()
+
+    def _refresh_facts(self) -> None:
+        name = self.name.text().strip()
+        if not name or self.steward.store.get_machine(name) is None:
+            self.status.setText("Save the machine first, then refresh its facts.")
+            return
+        target = name
+        self.status.setText(f"Reading facts for {target}…")
+
+        def attempt() -> str:
+            from steward.core.facts import describe, refresh_machine_facts
+
+            found = refresh_machine_facts(self.steward.store, target)
+            return describe(found[0]) if found else f"{target}: facts unavailable"
 
         self._thread = _CallThread(attempt)
         self._thread.ok.connect(lambda text: self.status.setText(str(text)))
