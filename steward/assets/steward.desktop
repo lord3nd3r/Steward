@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Steward
+GenericName=Local AI Assistant
+Comment=Local multi-agent personal assistant powered by Ollama or llama.cpp
+Exec=steward-gui
+Icon=steward
+Terminal=false
+Categories=Utility;Chat;
+Keywords=ai;llm;ollama;assistant;agents;linux;
+StartupNotify=true
