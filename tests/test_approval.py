@@ -24,7 +24,6 @@ def test_readonly_commands_stay_readonly():
         "echo hello",
         "echo 'rm -rf /'",
         "ls /usr/bin/dd",
-        "FOO=1 ls /tmp",
         "sudo -n cat /etc/hostname",
     ]:
         result = classify_command(command)
@@ -40,9 +39,41 @@ def test_mutating_commands_are_not_readonly():
         "git commit -m hi",
         "python -c 'print(1)'",
         "touch /tmp/x",
+        "FOO=1 ls /tmp",
     ]:
         result = classify_command(command)
         assert result.level == "mutating", command
+
+
+def test_readonly_mode_rejects_side_effects_and_ambiguous_shell():
+    commands = [
+        "git branch new-branch", "git branch -D old-branch",
+        "git remote add demo /tmp/demo", "git remote remove origin",
+        "git diff --output=/tmp/out", "git log --output /tmp/out",
+        "git diff --out=/tmp/out", "/tmp/ls", "./cat /etc/hostname",
+        "git -c core.pager=evil log", "git --exec-path=/tmp status",
+        "sort -o /tmp/out /etc/hostname", "uniq /etc/hostname /tmp/out",
+        "sed -n 'w /tmp/out' /etc/hostname", "awk 'BEGIN {system(\"touch /tmp/out\")}'",
+        "xxd /etc/hostname /tmp/out", "file -C", "date -s tomorrow",
+        "hostname changed", "journalctl --vacuum-time=1s", "dmesg -C",
+        "rg --pre=evil hello", "rg --hostname-bin=evil --hyperlink-format=default hello",
+        "nmcli radio wifi off", "nmcli general hostname changed",
+        "pacman -Sy", "pacman -Syi package", "pacman -Q --dbpath /tmp/db",
+        "apt -o APT::Update::Pre-Invoke::=evil list", "env -S 'touch /tmp/out'",
+        "nohup ls", "echo ok & touch /tmp/out", 'echo "$(touch /tmp/out)"',
+        'echo "`touch /tmp/out`"', "cat <(touch /tmp/out)", "$COMMAND",
+    ]
+    for command in commands:
+        assessment = classify_command(command)
+        assert assessment.level != "readonly", command
+        assert needs_human_approval("auto_readonly", "mutate", assessment)[0], command
+
+
+def test_common_inspection_still_auto_approves():
+    for command in ["git branch", "git branch -a", "git remote -v",
+                    "git -C /tmp/repo diff", "lsusb; lsmod | grep uvc",
+                    "rg --files /tmp", "nmcli device status", "pacman -Qi bash"]:
+        assert classify_command(command).level == "readonly", command
 
 
 def test_destructive_commands_are_flagged():

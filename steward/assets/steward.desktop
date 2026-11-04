@@ -2,8 +2,8 @@
 Version=1.0
 Type=Application
 Name=Steward
-GenericName=Local AI Assistant
-Comment=Local multi-agent personal assistant powered by Ollama or llama.cpp
+GenericName=Linux Machine Assistant
+Comment=Manage Linux machines with local models, approved commands, and memory
 Exec=steward-gui
 Icon=steward
 Terminal=false

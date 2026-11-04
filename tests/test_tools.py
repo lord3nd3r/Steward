@@ -100,8 +100,29 @@ class _Transport:
 
 
 class _Channel:
+    def __init__(self, out=b"remote-ok\n", err=b""):
+        self.out = out
+        self.err = err
+
     def shutdown_write(self):
         pass
+
+    def recv_ready(self):
+        return bool(self.out)
+
+    def recv_stderr_ready(self):
+        return bool(self.err)
+
+    def recv(self, n):
+        data, self.out = self.out[:n], self.out[n:]
+        return data
+
+    def recv_stderr(self, n):
+        data, self.err = self.err[:n], self.err[n:]
+        return data
+
+    def exit_status_ready(self):
+        return True
 
     def recv_exit_status(self):
         return 0
@@ -114,6 +135,9 @@ class _Stdin:
 
     def write(self, data):
         self.buf += data
+
+    def flush(self):
+        pass
 
 
 class _Reader:
@@ -180,3 +204,25 @@ def test_ssh_command_pins_host_key_and_hides_the_password(monkeypatch):
     machine.host_key_fingerprint = "SHA256:different"
     with pytest.raises(Exception, match="Host key"):
         run_ssh_command(machine, store, "true", timeout=5)
+
+
+def test_ssh_drains_both_streams_with_bounded_output(monkeypatch):
+    client = _Client()
+    channel = _Channel(out=b"x" * 200000, err=b"y" * 200000)
+
+    def execute(command, timeout=None):
+        out, err = _Reader(b""), _Reader(b"")
+        out.channel = err.channel = channel
+        return client.stdin, out, err
+
+    client.exec_command = execute
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    store = Store()
+    machine = store.upsert_machine(Machine(name="SER", host="ser.local", user="ada"))
+    result = run_ssh_command(machine, store, "noisy-command", timeout=5)
+    assert result.exit_code == 0
+    assert result.stdout.startswith("x" * 64000)
+    assert result.stderr.startswith("y" * 64000)
+    assert "truncated 136000 bytes" in result.stdout
+    assert "truncated 136000 bytes" in result.stderr
+    assert client.closed

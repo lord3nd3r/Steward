@@ -1,6 +1,8 @@
 # Steward
 
-Steward is a local, multi-agent personal assistant for Linux. Each agent has its own name, persona, model, and memory. It talks to **Ollama** or **llama.cpp** (`llama-server`) on your machine, and it can actually do the work: run a shell command, read a file, or SSH to another computer you have registered. A new install has no agents and no machines until you add them.
+Steward is a local assistant for managing your Linux machines. It talks to **Ollama** or **llama.cpp** (`llama-server`) on your machine, and it can do the work: investigate a problem, propose a change, run an approved command, and check the result locally or over SSH.
+
+You can create separate assistants, each with its own name, persona, model, conversation, and memory. These agents work independently; they do not delegate tasks to one another. A new install has no agents and no machines until you add them.
 
 The desktop app and the terminal share one Python core, so a turn behaves the same way in both.
 
@@ -133,7 +135,7 @@ Two things still stop for a person, in every mode:
 
 If a command fails with a permission error, the tool result tells the agent to retry once with `sudo`. That retry still goes through approval. The password is still never written down.
 
-The classifier is a heuristic, not a sandbox. The dialog shows the exact string that will run. Read-only detection understands common inspection commands (`ls`, `cat`, `df`, `systemctl status`, `git status`, `apt list`, pipelines of those, and so on). Anything it does not recognize is treated as a change.
+The classifier is a heuristic, not a sandbox. The dialog shows the exact string that will run. Read-only detection understands common inspection commands (`ls`, `cat`, `df`, `systemctl status`, `git status`, `apt list`, pipelines of those, and so on). Anything it does not recognize is treated as a change. Scripting tools such as `awk` and `sed`, commands with shell expansions, and tools with broad file-writing options such as `sort` require approval in `auto_readonly`. Git branch creation, remote changes, and output-file options also require approval; listing branches and remotes can run automatically.
 
 ## Memory
 
@@ -206,7 +208,18 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests cover approval decisions, the SQLite store, local commands, SSH command construction with a stand-in client (the sudo password stays off the command string), the agent loop including denial and the step limit, both stream parsers, and a real HTTP conversation against a local stand-in for Ollama: the agent runs `echo`, saves a note, and sees that note in the next turn.
+The tests cover approval decisions, the SQLite store, local commands and child-process cancellation, bounded output on both streams, SSH command construction with a stand-in client (the sudo password stays off the command string), the agent loop including denial and the step limit, both stream parsers, and a real HTTP conversation against a local stand-in for Ollama: the agent runs `echo`, saves a note, and sees that note in the next turn.
+
+To evaluate an actual installed model:
+
+```bash
+STEWARD_EVAL_MODEL=<model> python -m pytest tests/test_live_models.py -v --junitxml=/tmp/steward-model-results.xml
+# llama.cpp, or force the text tool protocol:
+STEWARD_EVAL_BACKEND=llama_cpp STEWARD_EVAL_MODEL=<model> STEWARD_EVAL_PROTOCOL=text \
+  python -m pytest tests/test_live_models.py -v
+```
+
+Set `STEWARD_EVAL_URL` for a non-default server URL. These opt-in evaluations send real requests to the model but replace all machine tools with simulated responses. They test target-machine selection, investigation after a failed command, stopping after a denied action, and note recall after clearing conversation history. They use temporary config, memory, and machines; no shell command or SSH connection is executed by model-generated calls. Without `STEWARD_EVAL_MODEL`, these four tests are skipped. Passing the scripted tests alone does not establish model reliability; run the live evaluations for each model and protocol you intend to use.
 
 ## Limits
 
@@ -214,8 +227,8 @@ The tests cover approval decisions, the SQLite store, local commands, SSH comman
 - `doas` is recognized as privileged, but a password is only injected for `sudo`.
 - File tools run as the login user. Writing a root-owned file means a `sudo` shell command, which goes through approval.
 - There is no built-in machine. Until you add one, including this computer, the agent cannot run commands or read files.
-- Very large command output is truncated before it is stored and sent back to the model.
-- Stopping a turn kills a local process. A remote command is closed as soon as the SSH session drops, which is not always instant.
+- Command output is drained continuously, keeping at most 64,000 bytes each of stdout and stderr, plus a truncation notice, before storing it or sending it to the model.
+- Stopping or timing out a local command kills its process group, including ordinary child processes. Processes that deliberately detach into another session can escape that group. A remote command is closed as soon as the SSH session drops; remote processes may continue, depending on the server and command.
 - There is no account system. Anyone who can run Steward as you can drive your machines, subject to the approval mode of the agent.
 - Embedding search is not implemented yet. The `MemoryIndex` protocol in `steward/core/memory_index.py` is where it would go.
 

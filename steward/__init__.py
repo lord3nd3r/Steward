@@ -1,3 +1,3 @@
-"""Steward: a local multi-agent personal assistant."""
+"""Steward: a local assistant for managing Linux machines."""
 
 __version__ = "0.1.0"

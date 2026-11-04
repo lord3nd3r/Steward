@@ -34,7 +34,7 @@ app = typer.Typer(
     add_completion=False,
     no_args_is_help=False,
     invoke_without_command=True,
-    help="Local multi-agent assistant. Models stay on your machines.",
+    help="Local assistant for managing Linux machines. Models stay on your machines.",
 )
 agents_app = typer.Typer(no_args_is_help=True, help="Create and manage agents. A new install has none.")
 machines_app = typer.Typer(
@@ -73,7 +73,7 @@ def _root(
     ctx: typer.Context,
     version: bool = typer.Option(False, "--version", help="Show the version and exit.", callback=_version, is_eager=True),
 ) -> None:
-    """Local multi-agent assistant. A new install has no agents and no machines."""
+    """Local assistant for Linux machines. A new install has no agents and no machines."""
     if os.environ.get("STEWARD_DEBUG"):
         import logging
 

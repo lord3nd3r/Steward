@@ -17,20 +17,20 @@ from steward.core.models import CommandAssessment
 _QUOTE_RE = re.compile(r"'(?:\\.|[^'])*'|\"(?:\\.|[^\"])*\"")
 _SUB_RE = re.compile(r"\$\(([^)]*)\)|`([^`]*)`")
 
+# Only tools without known scripting/output modes belong here. Tools with
+# subcommands or side-effecting options are handled separately below.
 _SIMPLE_READONLY = {
-    "ls", "cat", "head", "tail", "less", "more", "file", "stat", "du", "df", "free",
-    "ps", "uptime", "whoami", "id", "uname", "hostname", "date", "pwd", "which",
-    "whereis", "echo", "printf", "true", "false", "wc", "sort", "uniq", "cut", "tr",
-    "column", "nl", "od", "hexdump", "xxd", "strings", "lsof", "lscpu", "lsblk",
-    "lsusb", "lspci", "lsmem", "lsmod", "sensors", "cal", "printenv", "dmesg",
-    "journalctl", "timedatectl", "hostnamectl", "localectl", "who", "w", "last",
-    "groups", "getent", "blkid", "findmnt", "basename", "dirname", "realpath",
-    "readlink", "cmp", "diff", "comm", "sha256sum", "sha1sum", "md5sum", "cksum",
-    "nproc", "arch", "vmstat", "iostat", "mpstat", "pidof", "pgrep", "ss", "netstat",
-    "ping", "ping6", "traceroute", "tracepath", "dig", "nslookup", "host", "rg",
-    "grep", "egrep", "fgrep", "awk", "tty", "lsb_release", "seq", "tac", "rev",
-    "fold", "paste", "join", "test", "[", ":", "true", "false",
-    "uname", "hostnamectl", "who",
+    "ls", "cat", "head", "tail", "stat", "du", "df", "free", "ps", "uptime",
+    "whoami", "id", "uname", "pwd", "which", "whereis", "echo", "printf",
+    "true", "false", "wc", "cut", "tr", "column", "nl", "od", "hexdump",
+    "strings", "lsof", "lscpu", "lsblk", "lsusb", "lspci", "lsmem", "lsmod",
+    "sensors", "cal", "printenv", "who", "w", "last", "groups", "getent",
+    "blkid", "findmnt", "basename", "dirname", "realpath", "readlink",
+    "cmp", "comm", "sha256sum", "sha1sum", "md5sum", "cksum", "nproc",
+    "arch", "vmstat", "iostat", "mpstat", "pidof", "pgrep", "netstat",
+    "ping", "ping6", "traceroute", "tracepath", "dig", "nslookup", "host",
+    "tty", "lsb_release", "seq", "tac", "rev", "fold", "paste", "join",
+    "test", "[", ":",
 }
 
 _WRAPPERS = {"env", "command", "time", "nice", "nohup", "stdbuf"}
@@ -41,7 +41,7 @@ _SUDO_WITH_ARG = {
 }
 _QUOTE_SAFE = {"echo", "printf", "cat", "grep", "rg", "egrep", "fgrep", "less", "more", "head", "tail"}
 
-_GIT_READONLY = {"status", "log", "diff", "show", "branch", "remote", "rev-parse", "ls-files", "describe"}
+_GIT_READONLY = {"status", "log", "diff", "show", "rev-parse", "ls-files", "describe"}
 _SYSTEMCTL_READONLY = {
     "status", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files",
     "show", "cat", "list-dependencies", "get-default",
@@ -197,6 +197,14 @@ def _classify_stage(stage: str) -> tuple[str, bool, list[str]]:
     except ValueError:
         return "mutating", _stage_uses_sudo(stage), ["could not parse the command"]
 
+    # Expansion in double quotes is executable shell syntax too. Treat
+    # constructs our small stage parser does not understand conservatively.
+    expanded = re.sub(r"'[^']*'", "", stage)
+    uncertain_shell = any(c in expanded for c in ("$", "`", "(", ")", "{", "}"))
+    uncertain_shell = uncertain_shell or "&" in re.sub(r"\d*>&\d+", "", code)
+    unsafe_wrapper = any(_is_assignment(t) for t in tokens) or any(
+        Path(t).name in _WRAPPERS for t in tokens[:1]
+    )
     tokens, sudo_here = _unwrap(tokens)
     needs_sudo = needs_sudo or sudo_here
     if not tokens:
@@ -213,7 +221,7 @@ def _classify_stage(stage: str) -> tuple[str, bool, list[str]]:
             if hit:
                 return "destructive", needs_sudo, [hit]
 
-    if substitution or _has_file_redirect(code):
+    if substitution or uncertain_shell or unsafe_wrapper or _has_file_redirect(code):
         return "mutating", needs_sudo, reasons
 
     if _is_readonly(tokens):
@@ -291,8 +299,6 @@ def _argv_destructive(tokens: list[str]) -> str | None:
         return "zfs destroy"
     if name == "btrfs" and "delete" in args:
         return "btrfs delete"
-    if name == "git" and False:
-        return None
     return None
 
 
@@ -319,17 +325,20 @@ def _git_destructive(args: list[str]) -> bool:
 def _is_readonly(tokens: list[str]) -> bool:
     name = Path(tokens[0]).name
     args = tokens[1:]
-    if name in _SIMPLE_READONLY:
-        if name == "mount":
-            return len(args) == 0 or args == ["-l"]
-        if name == "find":
-            blocked = {"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprintf", "-fls"}
-            return not any(a in blocked for a in args)
-        return True
-    if name == "sed":
-        return not any(a == "-i" or a.startswith("-i") for a in args)
+    if "/" in tokens[0] and str(Path(tokens[0]).parent) not in {"/bin", "/usr/bin", "/sbin", "/usr/sbin"}:
+        return False
+    # Programs with scripting, output-file, or configuration options need
+    # argument checks. A familiar executable name alone is not sufficient.
+    if name in {"rg", "grep", "egrep", "fgrep"}:
+        return not any(a.split("=", 1)[0] in {"--pre", "--hostname-bin"} for a in args)
+    if name in {"apt", "apt-cache", "dnf", "yum"} and any(
+        a.startswith(("-o", "-c", "--option", "--config", "--setopt", "--installroot")) for a in args
+    ):
+        return False
     if name == "git":
-        return _git_sub(args) in _GIT_READONLY
+        return _git_readonly(args)
+    if name in _SIMPLE_READONLY:
+        return True
     if name == "systemctl":
         return _first_positional(args) in _SYSTEMCTL_READONLY
     if name in {"docker", "podman"}:
@@ -344,34 +353,60 @@ def _is_readonly(tokens: list[str]) -> bool:
     if name in {"dnf", "yum"}:
         return _first_positional(args) in _DNF_READONLY
     if name == "rpm":
-        return any(a in {"-q", "--query", "-qi", "-qa"} or (a.startswith("-") and "q" in a) for a in args)
+        return bool(args) and args[0] in {"-q", "--query", "-qi", "-qa"} and not any(
+            a.startswith(("--eval", "--pipe", "--define", "--predefine", "--rcfile", "--macros")) for a in args
+        )
     if name == "pacman":
         return _pacman_readonly(args)
     if name == "ip":
         return _ip_readonly(args)
     if name == "nmcli":
-        if not args:
-            return True
-        if args[0] in {"general", "radio", "device"} and "delete" not in args and "modify" not in args:
-            if args[0] == "device" and any(a in {"connect", "disconnect", "reapply", "modify"} for a in args):
-                return False
-            return "up" not in args and "down" not in args
-        if args[0] == "connection" and (len(args) == 1 or args[1] == "show"):
-            return True
-        return False
+        return not args or args in (["general"], ["general", "status"], ["radio"],
+                                    ["device"], ["device", "status"], ["device", "show"],
+                                    ["connection", "show"])
     if name == "mount":
         return len(args) == 0 or args == ["-l"]
     return False
 
 
-def _git_sub(args: list[str]) -> str:
+def _git_readonly(args: list[str]) -> bool:
+    # Only -C is accepted before the subcommand. -c, --exec-path and
+    # --config-env can arrange execution even for an inspection command.
     index = 0
-    while index < len(args) and args[index].startswith("-"):
-        if args[index] in {"-C", "-c", "--git-dir", "--work-tree"} and index + 1 < len(args):
-            index += 2
-            continue
-        index += 1
-    return args[index] if index < len(args) else ""
+    while index < len(args) and args[index] == "-C":
+        if index + 1 >= len(args):
+            return False
+        index += 2
+    if index >= len(args):
+        return False
+    sub, rest = args[index], args[index + 1:]
+    if sub == "branch":
+        return not rest or all(a in {"--list", "-a", "--all", "-r", "--remotes", "-v", "-vv"} for a in rest)
+    if sub == "remote":
+        return not rest or rest == ["-v"] or rest == ["--verbose"]
+    if sub not in _GIT_READONLY:
+        return False
+    # An allowlist also rejects abbreviated options such as --out, which
+    # Git can accept as --output. Unknown flags go through approval.
+    flags = {
+        "--", "--short", "-s", "--porcelain", "-z", "--branch", "-b",
+        "--oneline", "--all", "--stat", "--numstat", "--shortstat",
+        "--name-only", "--name-status", "--summary", "--check", "--cached",
+        "--staged", "--no-ext-diff", "--no-textconv", "--no-color",
+        "--no-patch", "-p", "--patch", "--raw", "--reverse", "--first-parent",
+        "--no-merges", "--merges", "--decorate", "--graph", "--follow",
+        "--tags", "--always", "--dirty", "--long", "--abbrev-ref",
+        "--show-toplevel", "--show-prefix", "--is-inside-work-tree",
+        "--verify", "--quiet", "-q", "--stage", "--others", "--modified",
+        "--deleted", "--exclude-standard", "--full-name", "-n",
+    }
+    values = ("--format=", "--pretty=", "--max-count=", "--since=", "--until=",
+              "--author=", "--grep=", "--abbrev=", "--porcelain=", "--untracked-files=")
+    return all(
+        not a.startswith("-") or a in flags or a.startswith(values)
+        or re.fullmatch(r"-(?:\d+|n\d+|U\d+)", a)
+        for a in rest
+    )
 
 
 def _first_positional(args: list[str]) -> str:
@@ -382,10 +417,12 @@ def _first_positional(args: list[str]) -> str:
 
 
 def _pacman_readonly(args: list[str]) -> bool:
+    if any(a.startswith("--") for a in args):
+        return False
     flags = "".join(a[1:] for a in args if a.startswith("-") and not a.startswith("--"))
     if re.search(r"[RUD]", flags):
         return False
-    if "S" in flags and not any(letter in flags for letter in ("s", "i", "l")):
+    if "S" in flags and ("y" in flags or "u" in flags or not any(letter in flags for letter in ("s", "i", "l"))):
         return False
     return "Q" in flags or "s" in flags or "i" in flags or "l" in flags
 

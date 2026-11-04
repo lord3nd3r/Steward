@@ -7,8 +7,11 @@ not written into the command string, the database, or notes.
 from __future__ import annotations
 
 import hashlib
+import os
+import selectors
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import threading
@@ -76,6 +79,8 @@ def run_local_command(
     sudo_password: str | None = None,
     cancel: threading.Event | None = None,
 ) -> CommandResult:
+    if cancel is not None and cancel.is_set():
+        return CommandResult(130, "", "Cancelled.")
     command_to_run, stdin_bytes = apply_sudo_password(command, sudo_password)
     try:
         proc = subprocess.Popen(
@@ -86,47 +91,106 @@ def run_local_command(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=cwd or None,
+            start_new_session=True,
         )
     except FileNotFoundError as exc:
         return CommandResult(127, "", f"Could not start bash: {exc}")
     except OSError as exc:
         return CommandResult(1, "", str(exc))
 
-    holder: dict[str, object] = {}
+    out, err = _OutputBuffer(), _OutputBuffer()
+    deadline = time.monotonic() + timeout
+    notice = ""
+    code = None
+    pending = memoryview(stdin_bytes or b"")
+    try:
+        with selectors.DefaultSelector() as selector:
+            for stream, buffer in ((proc.stdout, out), (proc.stderr, err)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, buffer)
+            if pending:
+                os.set_blocking(proc.stdin.fileno(), False)
+                selector.register(proc.stdin, selectors.EVENT_WRITE, None)
+            else:
+                proc.stdin.close()
+            while selector.get_map() or proc.poll() is None:
+                if cancel is not None and cancel.is_set():
+                    code, notice = 130, "Cancelled."
+                    break
+                if time.monotonic() >= deadline:
+                    code, notice = 124, f"Timed out after {timeout}s."
+                    break
+                for key, _ in selector.select(timeout=0.05):
+                    if key.fileobj is proc.stdin:
+                        try:
+                            written = os.write(key.fd, pending)
+                            pending = pending[written:]
+                        except BrokenPipeError:
+                            pending = pending[:0]
+                        if not pending:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                    else:
+                        chunk = os.read(key.fd, 8192)
+                        if chunk:
+                            key.data.append(chunk)
+                        else:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+            if code is not None:
+                _kill_process_group(proc)
+                # Drain bytes already in the pipes without waiting for a
+                # descendant that deliberately escaped the process group.
+                for key in list(selector.get_map().values()):
+                    if key.fileobj is proc.stdin:
+                        continue
+                    for _ in range(16):
+                        try:
+                            chunk = os.read(key.fd, 8192)
+                        except BlockingIOError:
+                            break
+                        if not chunk:
+                            break
+                        key.data.append(chunk)
+        proc.wait()
+        return _result(
+            proc.returncode if code is None else code,
+            out.text(),
+            (err.text() + "\n" + notice).strip(),
+            sudo_password,
+        )
+    finally:
+        if proc.poll() is None:
+            _kill_process_group(proc)
+            proc.wait()
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            stream.close()
 
-    def _wait() -> None:
-        try:
-            out, err = proc.communicate(stdin_bytes, timeout=timeout)
-            holder["out"] = (proc.returncode, out, err)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            out, err = proc.communicate()
-            holder["out"] = (124, out, err, True)
-        except Exception as exc:  # pragma: no cover - defensive
-            holder["error"] = exc
 
-    thread = threading.Thread(target=_wait, daemon=True)
-    thread.start()
-    while thread.is_alive():
-        if cancel is not None and cancel.is_set():
-            proc.kill()
-            thread.join(timeout=2)
-            out, err = _take_output(holder)
-            return _result(130, out, (err + "\nCancelled.").strip(), sudo_password)
-        thread.join(0.05)
+def _kill_process_group(proc: subprocess.Popen) -> None:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
-    if "error" in holder:
-        return CommandResult(1, "", scrub_secret(str(holder["error"]), sudo_password))
-    payload = holder.get("out")
-    if not isinstance(payload, tuple):
-        return CommandResult(1, "", "The command ended without output.")
-    timed_out = len(payload) == 4
-    code, out, err = payload[0], payload[1], payload[2]
-    stdout = _decode(out if isinstance(out, bytes) else b"")
-    stderr = _decode(err if isinstance(err, bytes) else b"")
-    if timed_out:
-        stderr = (stderr + f"\nTimed out after {timeout}s.").strip()
-    return _result(int(code) if code is not None else 1, stdout, stderr, sudo_password)
+
+class _OutputBuffer:
+    """Keep a bounded prefix while continuing to drain the producer."""
+
+    def __init__(self) -> None:
+        self.data = bytearray()
+        self.discarded = 0
+
+    def append(self, chunk: bytes) -> None:
+        keep = min(len(chunk), _MAX_BYTES - len(self.data))
+        self.data.extend(chunk[:keep])
+        self.discarded += len(chunk) - keep
+
+    def text(self) -> str:
+        text = _decode(bytes(self.data))
+        if self.discarded:
+            text += f"\n...[truncated {self.discarded} bytes]"
+        return text
 
 
 def run_ssh_command(
@@ -140,6 +204,8 @@ def run_ssh_command(
     cancel: threading.Event | None = None,
     connect_timeout: int | None = None,
 ) -> CommandResult:
+    if cancel is not None and cancel.is_set():
+        return CommandResult(130, "", "Cancelled.")
     command_to_run = command
     if cwd:
         command_to_run = f"cd {shlex.quote(cwd)} && {command_to_run}"
@@ -151,40 +217,31 @@ def run_ssh_command(
     )
     try:
         stdin, stdout, stderr = client.exec_command(command_to_run, timeout=timeout)
-        if stdin_bytes and stdin is not None:
+        if stdin_bytes:
             stdin.write(stdin_bytes)
-        try:
-            stdin.channel.shutdown_write()
-        except Exception:
-            pass
-        holder: dict[str, object] = {}
-
-        def _read() -> None:
-            try:
-                out = stdout.read()
-                err = stderr.read()
-                code = stdout.channel.recv_exit_status()
-                holder["out"] = (code, out, err)
-            except Exception as exc:
-                holder["error"] = exc
-
-        thread = threading.Thread(target=_read, daemon=True)
-        thread.start()
-        start = time.monotonic()
-        while thread.is_alive():
+            stdin.flush()
+        channel = stdout.channel
+        channel.shutdown_write()
+        out, err = _OutputBuffer(), _OutputBuffer()
+        deadline = time.monotonic() + timeout
+        while True:
             if cancel is not None and cancel.is_set():
-                client.close()
-                thread.join(timeout=1)
-                return CommandResult(130, "", "Cancelled.")
-            if time.monotonic() - start > timeout:
-                client.close()
-                thread.join(timeout=1)
-                return CommandResult(124, "", f"Timed out after {timeout}s.")
-            thread.join(0.05)
-        if "error" in holder:
-            raise StewardError(f"SSH command on {machine.name} failed: {holder['error']}")
-        code, out, err = holder["out"]  # type: ignore[misc]
-        return _result(int(code), _decode(out), _decode(err), sudo_password)
+                return _result(130, out.text(), (err.text() + "\nCancelled.").strip(), sudo_password)
+            if time.monotonic() >= deadline:
+                return _result(124, out.text(), (err.text() + f"\nTimed out after {timeout}s.").strip(), sudo_password)
+            # Drain both SSH streams on every pass. Reading stdout to EOF
+            # first can deadlock when stderr fills the SSH window.
+            received = False
+            if channel.recv_ready():
+                out.append(channel.recv(8192))
+                received = True
+            if channel.recv_stderr_ready():
+                err.append(channel.recv_stderr(8192))
+                received = True
+            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
+                return _result(channel.recv_exit_status(), out.text(), err.text(), sudo_password)
+            if not received:
+                time.sleep(0.02)
     finally:
         client.close()
 
@@ -413,12 +470,3 @@ def _decode(data: bytes) -> str:
 
 def _result(code: int, stdout: str, stderr: str, secret: str | None) -> CommandResult:
     return CommandResult(code, scrub_secret(stdout, secret), scrub_secret(stderr, secret))
-
-
-def _take_output(holder: dict[str, object]) -> tuple[str, str]:
-    payload = holder.get("out")
-    if isinstance(payload, tuple) and len(payload) >= 3:
-        out = payload[1] if isinstance(payload[1], bytes) else b""
-        err = payload[2] if isinstance(payload[2], bytes) else b""
-        return _decode(out), _decode(err)
-    return "", ""

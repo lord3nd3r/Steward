@@ -77,7 +77,7 @@ class MainWindow(QMainWindow):
         wordmark = QLabel("Steward")
         wordmark.setObjectName("wordmark")
         wordmark.setFont(QFont("Liberation Serif", 22))
-        tagline = QLabel("Local assistants, with memory")
+        tagline = QLabel("Your Linux machines, with memory")
         tagline.setObjectName("tagline")
         new_agent = QPushButton("New agent")
         new_agent.setObjectName("primary")
