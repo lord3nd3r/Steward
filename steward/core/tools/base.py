@@ -40,6 +40,14 @@ class Tool:
         level = "readonly" if self.approval_class in {"safe", "read"} else "mutating"
         return CommandAssessment(level=level, needs_sudo=False, reasons=())
 
+    def classify_with_context(
+        self, arguments: dict[str, Any], context: ToolContext
+    ) -> CommandAssessment:
+        return self.classify(arguments)
+
+    def preview(self, arguments: dict[str, Any], context: ToolContext) -> str | None:
+        return None
+
     def execute(self, arguments: dict[str, Any], context: ToolContext) -> str:
         raise NotImplementedError
 

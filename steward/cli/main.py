@@ -6,6 +6,7 @@ import functools
 import getpass
 import os
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -26,7 +27,7 @@ from steward.core.models import (
     ApprovalRequest,
     Machine,
 )
-from steward.core.paths import config_path, database_path
+from steward.core.paths import config_path, data_dir, database_path, ensure_private_dir
 from steward.core.service import open_steward
 
 console = Console(highlight=False)
@@ -89,6 +90,23 @@ def gui_command() -> None:
     from steward.gui.app import main as gui_main
 
     gui_main()
+
+
+@app.command("backup")
+@guarded
+def backup_command(
+    output: Path | None = typer.Option(None, "--output", "-o", help="Destination database file."),
+    overwrite: bool = typer.Option(False, "--overwrite", help="Replace an existing destination."),
+) -> None:
+    """Create a private SQLite backup of agents, notes, machines, and history."""
+    steward = open_steward()
+    if output is None:
+        directory = data_dir() / "backups"
+        ensure_private_dir(directory)
+        stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+        output = directory / f"steward-{stamp}.db"
+    destination = steward.store.backup_to(output, overwrite=overwrite)
+    console.print(f"Database backup written to {destination}.")
 
 
 @app.command("chat")

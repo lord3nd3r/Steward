@@ -256,11 +256,7 @@ def connect_ssh(machine: Machine, store: Store, *, timeout: int = 15) -> paramik
         except OSError:
             pass
 
-    class _AcceptOnce(paramiko.MissingHostKeyPolicy):
-        def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
-            client.get_host_keys().add(hostname, key.get_name(), key)
-
-    client.set_missing_host_key_policy(_AcceptOnce())
+    client.set_missing_host_key_policy(paramiko.RejectPolicy())
     kwargs: dict[str, object] = {
         "hostname": machine.host,
         "port": machine.port,
@@ -296,6 +292,12 @@ def connect_ssh(machine: Machine, store: Store, *, timeout: int = 15) -> paramik
         ) from exc
     except paramiko.SSHException as exc:
         client.close()
+        if "not found in known_hosts" in str(exc):
+            raise StewardError(
+                f"SSH host key for {machine.host}:{machine.port} is not verified. "
+                f"Review it with `ssh -p {machine.port} {machine.user}@{machine.host}`, "
+                "then retry Steward."
+            ) from exc
         raise StewardError(f"SSH error talking to {machine.name}: {exc}") from exc
     except (OSError, socket.error) as exc:
         client.close()
@@ -370,6 +372,18 @@ def write_remote_bytes(machine: Machine, store: Store, path: str, data: bytes, m
             with sftp.open(target, "wb") as handle:
                 handle.write(data)
             return target
+        finally:
+            sftp.close()
+    finally:
+        client.close()
+
+
+def remove_remote_file(machine: Machine, store: Store, path: str) -> None:
+    client = connect_ssh(machine, store)
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.remove(_remote_path(client, sftp, path))
         finally:
             sftp.close()
     finally:

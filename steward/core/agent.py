@@ -179,6 +179,15 @@ class AgentRunner:
         tool = self.registry.get(call.name)
         arguments = call.arguments if isinstance(call.arguments, dict) else {}
         machine, summary = summarize_action(call.name, arguments)
+        if call.name in MACHINE_TOOLS and not arguments.get("machine"):
+            machines = self.store.list_machines()
+            if len(machines) == 1:
+                machine = machines[0].name
+        if call.name == "restore_file":
+            backup = self.store.get_file_backup(str(arguments.get("backup_id") or ""))
+            if backup is not None:
+                machine = backup.machine
+                summary = f"{backup.path}\nBackup ID: {backup.id}"
         if tool is None:
             result = f"Error: unknown tool '{call.name}'. Available tools: {', '.join(self.registry.names())}."
             event = self.store.add_tool_event(
@@ -205,7 +214,10 @@ class AgentRunner:
 
         if not call.id:
             call.id = f"call_{uuid.uuid4().hex[:10]}"
-        assessment = tool.classify(arguments)
+        assessment = tool.classify_with_context(
+            arguments,
+            ToolContext(agent_id=agent.id, store=self.store, settings=self.settings, cancel=cancel),
+        )
         required, reason, password_only = needs_human_approval(
             agent.approval_mode, tool.approval_class, assessment
         )
@@ -216,6 +228,15 @@ class AgentRunner:
         if required:
             if on_status:
                 on_status("Waiting for approval")
+            try:
+                preview = tool.preview(
+                    arguments,
+                    ToolContext(agent_id=agent.id, store=self.store, settings=self.settings, cancel=cancel),
+                )
+                if preview:
+                    summary = preview
+            except Exception as exc:
+                summary += f"\n\nPreview unavailable: {exc}"
             request = ApprovalRequest(
                 tool_name=tool.name,
                 arguments=arguments,

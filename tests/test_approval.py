@@ -105,6 +105,26 @@ def test_sudo_is_detected_without_rewriting_echo():
     assert classify_command("sudo apt update").level == "mutating"
 
 
+def test_shell_control_flow_requires_review_and_rewrites_sudo():
+    commands = [
+        ("if true; then sudo touch /tmp/steward-probe; fi", "if true; then sudo -S -p '' touch /tmp/steward-probe; fi"),
+        ("case x in x) sudo touch /tmp/steward-probe;; esac", "case x in x) sudo -S -p '' touch /tmp/steward-probe;; esac"),
+        ("! sudo true", "! sudo -S -p '' true"),
+    ]
+    for command, expected in commands:
+        assessment = classify_command(command)
+        assert assessment.requires_review
+        assert assessment.needs_sudo
+        required, _reason, password_only = needs_human_approval("full_auto", "mutate", assessment)
+        assert required and not password_only
+        assert apply_sudo_password(command, "temporary") == (expected, b"temporary\n")
+
+    assert not classify_command('echo "then sudo"').needs_sudo
+    indirect = classify_command("bash -c 'sudo touch /tmp/steward-probe'")
+    assert indirect.requires_review and not indirect.needs_sudo
+    assert needs_human_approval("full_auto", "mutate", indirect)[0]
+
+
 def test_sudo_rewrite_keeps_the_password_off_the_command_line():
     password = "correct horse battery"
     rewritten, stdin = apply_sudo_password("echo hello && sudo apt update", password)

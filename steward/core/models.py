@@ -111,6 +111,17 @@ class ToolEventRecord:
     created_at: str
 
 
+@dataclass
+class FileBackup:
+    id: str
+    agent_id: str | None
+    machine: str
+    path: str
+    existed: bool
+    content: bytes | None
+    created_at: str
+
+
 @dataclass(frozen=True)
 class CommandAssessment:
     """How risky a shell command is. Destructive commands always need a person."""
@@ -118,6 +129,7 @@ class CommandAssessment:
     level: str  # readonly | mutating | destructive
     needs_sudo: bool = False
     reasons: tuple[str, ...] = ()
+    requires_review: bool = False
 
     @property
     def destructive(self) -> bool:

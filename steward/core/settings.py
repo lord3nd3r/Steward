@@ -7,7 +7,7 @@ import tomllib
 from dataclasses import dataclass
 
 from steward.core.errors import StewardError
-from steward.core.paths import config_path
+from steward.core.paths import config_path, ensure_private_dir
 
 _HEADER = """\
 # Steward settings.
@@ -26,8 +26,9 @@ class Settings:
     command_timeout: int = 180
     temperature: float = 0.3
     # Reserved for a future Ollama embedding index. "keyword" is the only
-    # implementation wired into the agent loop today.
+    # default; "ollama" uses a local embedding model when configured.
     memory_backend: str = "keyword"
+    memory_embedding_model: str = "nomic-embed-text"
 
     @classmethod
     def load(cls) -> Settings:
@@ -56,6 +57,9 @@ class Settings:
             ),
             temperature=_as_float(defaults.get("temperature", cls.temperature), "temperature", 0, 2),
             memory_backend=str(memory.get("backend", cls.memory_backend) or "keyword"),
+            memory_embedding_model=str(
+                memory.get("embedding_model", cls.memory_embedding_model) or "nomic-embed-text"
+            ),
         )
         return settings._with_env()
 
@@ -70,7 +74,9 @@ class Settings:
 
     def save(self) -> None:
         path = config_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(path.parent)
+        if path.exists():
+            path.chmod(0o600)
         body = _HEADER + (
             "\n[backends]\n"
             f"ollama_base_url = {_toml_string(self.ollama_base_url)}\n"
@@ -83,8 +89,10 @@ class Settings:
             f"temperature = {float(self.temperature)}\n"
             "\n[memory]\n"
             f"backend = {_toml_string(self.memory_backend)}\n"
+            f"embedding_model = {_toml_string(self.memory_embedding_model)}\n"
         )
         path.write_text(body, encoding="utf-8")
+        path.chmod(0o600)
 
 
 def _toml_string(value: str) -> str:

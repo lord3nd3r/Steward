@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from steward.core.errors import StewardError
@@ -18,6 +21,7 @@ from steward.core.models import (
     BACKENDS,
     TOOL_PROTOCOLS,
     Agent,
+    FileBackup,
     Machine,
     MachineFacts,
     Note,
@@ -25,7 +29,7 @@ from steward.core.models import (
     ToolCall,
     ToolEventRecord,
 )
-from steward.core.paths import database_path
+from steward.core.paths import database_path, ensure_private_dir
 from steward.core.settings import Settings
 
 _NAME_OK = re.compile(r"^[A-Za-z][A-Za-z0-9 _-]{0,39}$")
@@ -89,6 +93,16 @@ CREATE TABLE IF NOT EXISTS tool_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS file_backups (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    machine TEXT NOT NULL,
+    path TEXT NOT NULL,
+    existed INTEGER NOT NULL,
+    content BLOB,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS machine_facts (
     machine TEXT PRIMARY KEY COLLATE NOCASE,
     user_name TEXT NOT NULL DEFAULT '',
@@ -105,6 +119,7 @@ CREATE TABLE IF NOT EXISTS machine_facts (
 CREATE INDEX IF NOT EXISTS idx_messages_agent ON messages(agent_id, id);
 CREATE INDEX IF NOT EXISTS idx_notes_agent ON notes(agent_id);
 CREATE INDEX IF NOT EXISTS idx_events_agent ON tool_events(agent_id, id);
+CREATE INDEX IF NOT EXISTS idx_backups_created ON file_backups(created_at);
 """
 
 
@@ -115,12 +130,15 @@ def utcnow() -> str:
 class Store:
     def __init__(self, db_path=None) -> None:
         self.db_path = db_path or database_path()
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.db_path.parent)
+        if self.db_path.exists():
+            self.db_path.chmod(0o600)
         self._lock = threading.Lock()
         with self._lock:
             with self._connect() as conn:
                 conn.executescript(_SCHEMA)
                 _migrate(conn)
+        self.db_path.chmod(0o600)
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=15)
@@ -540,12 +558,40 @@ class Store:
 
     def relevant_notes(self, agent_id: str, query: str, limit: int = 8) -> list[Note]:
         notes = self.list_notes(agent_id)
-        backend = "keyword"
         try:
-            backend = Settings.load().memory_backend
+            settings = Settings.load()
         except StewardError:
-            backend = "keyword"
-        return get_memory_index(backend).search(notes, query, limit)
+            settings = Settings()
+        index = get_memory_index(
+            settings.memory_backend,
+            base_url=settings.ollama_base_url,
+            embedding_model=settings.memory_embedding_model,
+        )
+        return index.search(notes, query, limit)
+
+    def save_file_backup(
+        self,
+        agent_id: str,
+        machine: str,
+        path: str,
+        content: bytes | None,
+    ) -> FileBackup:
+        backup_id = uuid.uuid4().hex
+        now = utcnow()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT INTO file_backups
+                   (id, agent_id, machine, path, existed, content, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (backup_id, agent_id, machine, path, int(content is not None), content, now),
+            )
+            row = conn.execute("SELECT * FROM file_backups WHERE id = ?", (backup_id,)).fetchone()
+        return _file_backup(row)
+
+    def get_file_backup(self, backup_id: str) -> FileBackup | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM file_backups WHERE id = ?", (backup_id,)).fetchone()
+        return _file_backup(row) if row else None
 
     # ----- tool log -------------------------------------------------------
 
@@ -593,6 +639,37 @@ class Store:
                 (agent_id, limit),
             ).fetchall()
         return [_event(row) for row in reversed(rows)]
+
+    def backup_to(self, destination: str | Path, *, overwrite: bool = False) -> Path:
+        target = Path(destination).expanduser()
+        if target.resolve() == self.db_path.resolve():
+            raise StewardError("Backup destination must differ from the live database.")
+        if target.exists() and not overwrite:
+            raise StewardError(f"Backup already exists: {target}. Pass --overwrite to replace it.")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary = tempfile.mkstemp(
+            prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+        )
+        os.close(descriptor)
+        try:
+            with self._lock:
+                source = self._connect()
+                destination_db = sqlite3.connect(temporary)
+                try:
+                    source.backup(destination_db)
+                finally:
+                    destination_db.close()
+                    source.close()
+            os.chmod(temporary, 0o600)
+            os.replace(temporary, target)
+            target.chmod(0o600)
+        except Exception as exc:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+            raise StewardError(f"Could not back up the database to {target}: {exc}") from exc
+        return target
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
@@ -717,5 +794,17 @@ def _event(row: sqlite3.Row) -> ToolEventRecord:
         machine=row["machine"],
         approved=bool(row["approved"]),
         destructive=bool(row["destructive"]),
+        created_at=row["created_at"],
+    )
+
+
+def _file_backup(row: sqlite3.Row) -> FileBackup:
+    return FileBackup(
+        id=row["id"],
+        agent_id=row["agent_id"],
+        machine=row["machine"],
+        path=row["path"],
+        existed=bool(row["existed"]),
+        content=bytes(row["content"]) if row["content"] is not None else None,
         created_at=row["created_at"],
     )

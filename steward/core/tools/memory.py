@@ -41,7 +41,7 @@ class SaveNoteTool(Tool):
 
 class SearchNotesTool(Tool):
     name = "search_notes"
-    description = "Search this agent's notes about the user. Uses keyword match."
+    description = "Search this agent's notes using the configured keyword or embedding index."
     parameters = {
         "type": "object",
         "properties": {
@@ -70,7 +70,7 @@ class SearchNotesTool(Tool):
         if not chosen:
             return "No notes saved yet."
         if not matched:
-            header = "No note contained that query. Newest notes:\n"
+            header = "No exact keyword match. Related notes:\n"
         else:
             header = ""
         lines = [f"#{note.id} {note.title}: {note.content}" for note in chosen[:8]]

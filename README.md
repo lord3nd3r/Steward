@@ -106,17 +106,20 @@ The sidebar is the list of agents. The transcript streams. The activity column i
 | --- | --- |
 | `run_command` | Bash on a saved machine: this computer, or another host over SSH |
 | `read_file` | Read a text file on a saved machine |
-| `write_file` | Replace a text file. Runs as the login user, not as root |
+| `write_file` | Preview and replace a text file. Saves a restorable backup; runs as the login user, not as root |
+| `restore_file` | Restore a prior `write_file` backup. Always asks before restoring or deleting |
 | `list_directory` | List a directory |
 | `save_note` | Remember a fact. Same title updates the old note |
-| `search_notes` | Keyword search over this agent's notes |
+| `search_notes` | Search this agent's notes with the configured index |
 | `forget_note` | Delete one note by id or title |
 
 Nothing is registered for you. Add this computer with `steward machines add <name> --local`, or tick **This computer** in the Machines window. Other machines are a name, host, user, port, optional identity file, and a note about how sudo works there. The password itself is never part of that note. With no machines saved, command and file tools are not offered, and Steward tells you the command above.
 
+When a file write needs approval, Steward shows a unified diff. Before writing, it stores the previous contents (up to 1 MB) in the private database and returns a backup ID. Ask the agent to restore that ID with `restore_file` to undo the change; restoration always requires approval. Restoring a write that created a new file removes that file. Remote file writes always require review in `full_auto`, since Steward cannot safely resolve remote symlinks before approval.
+
 On the first turn that can use a machine, Steward reads each saved host once and caches a one-line summary: distro, package manager, whether that login is root, and whether `sudo` or `doas` is installed. Later turns reuse the cache. The probe is read-only and does not run `sudo`. `steward machines refresh` (or **Refresh facts** in the Machines window) reads them again. Changing a machine's host, user, or port drops its cache. Agents are prompted from that line: non-interactive package commands, `sudo` when the login is not root, a full upgrade (plus Flatpak or snap when those are installed) when asked to bring a machine up to date, and a look at devices and logs before changing anything.
 
-On the first successful SSH connection Steward records the server host key. If that key changes later, Steward refuses to connect.
+Before Steward connects to an SSH machine, verify its host key with OpenSSH, for example `ssh -p 22 <user>@<host>`. Compare the displayed fingerprint with a trusted source before accepting it. Steward rejects keys that are not in `~/.ssh/known_hosts`; after a verified connection it also records the fingerprint in its database and refuses later changes.
 
 ## Approval
 
@@ -137,6 +140,8 @@ If a command fails with a permission error, the tool result tells the agent to r
 
 The classifier is a heuristic, not a sandbox. The dialog shows the exact string that will run. Read-only detection understands common inspection commands (`ls`, `cat`, `df`, `systemctl status`, `git status`, `apt list`, pipelines of those, and so on). Anything it does not recognize is treated as a change. Scripting tools such as `awk` and `sed`, commands with shell expansions, and tools with broad file-writing options such as `sort` require approval in `auto_readonly`. Git branch creation, remote changes, and output-file options also require approval; listing branches and remotes can run automatically.
 
+Shell control-flow blocks such as `if`, loops, and `case`, commands the parser cannot parse, and `sudo`/`doas` text outside a recognized command position require explicit review even in `full_auto`. This remains a heuristic; do not treat approval classification as a sandbox.
+
 ## Memory
 
 Each agent has its own SQLite notes. The system prompt for every turn includes the notes that match the user's message, filled out with a few recent notes when the wording does not overlap. The agent is instructed to call `save_note` when it learns a preference or a fact about a machine, and not to store secrets.
@@ -153,7 +158,27 @@ steward notes delete 1 --agent <agent>
 
 The same list is in the window, under **Notes**. Conversation history is separate from notes. `steward agents clear-history <agent>` drops the transcript and the tool log and keeps the notes.
 
-Keyword search is the implementation that ships. `memory.backend` in the config is the hook for a later embedding index (Ollama `/api/embeddings`). Unknown values stay on keywords.
+Keyword search is the default. To enable semantic ranking, select Ollama embeddings in Settings or set:
+
+```toml
+[memory]
+backend = "ollama"
+embedding_model = "nomic-embed-text"
+```
+
+Pull the embedding model with `ollama pull nomic-embed-text`. Steward batches the query and notes through Ollama's `/api/embed` endpoint, ranks them by cosine similarity, and falls back to keyword search if embedding fails. The configured Ollama URL receives the query and note text.
+
+## Backups
+
+Create an online SQLite snapshot while Steward is running:
+
+```bash
+steward backup
+steward backup --output ~/steward-copy.db
+steward backup --output ~/steward-copy.db --overwrite
+```
+
+Without `--output`, the snapshot goes under `~/.local/share/steward/backups/`. Backup files are private by default, and an existing destination is not replaced unless `--overwrite` is given.
 
 ## Layout
 
@@ -169,9 +194,11 @@ Data lives in the XDG directories:
 | Path | Contents |
 | --- | --- |
 | `~/.config/steward/config.toml` | Server URLs, timeouts, history length |
-| `~/.local/share/steward/steward.db` | Agents, machines, transcripts, notes, tool log |
+| `~/.local/share/steward/steward.db` | Agents, machines, transcripts, notes, tool log, file recovery snapshots |
 
 `STEWARD_CONFIG_DIR` and `STEWARD_DATA_DIR` override those locations.
+
+Steward enforces mode `0700` on its config and data directories and mode `0600` on the config and database files. File recovery snapshots are stored in that database.
 
 ## Adding a tool
 
@@ -208,7 +235,7 @@ pip install -e ".[dev]"
 pytest
 ```
 
-The tests cover approval decisions, the SQLite store, local commands and child-process cancellation, bounded output on both streams, SSH command construction with a stand-in client (the sudo password stays off the command string), the agent loop including denial and the step limit, both stream parsers, and a real HTTP conversation against a local stand-in for Ollama: the agent runs `echo`, saves a note, and sees that note in the next turn.
+The tests cover approval decisions including shell control-flow review, private storage modes, SQLite backups and file recovery, local commands and child-process cancellation, bounded output on both streams, SSH host-key rejection and command construction with a stand-in client, semantic ranking with keyword fallback, the agent loop including denial and the step limit, both stream parsers, and a real HTTP conversation against a local stand-in for Ollama.
 
 To evaluate an actual installed model:
 
@@ -223,14 +250,18 @@ Set `STEWARD_EVAL_URL` for a non-default server URL. These opt-in evaluations se
 
 ## Limits
 
-- Destructive-command detection is deliberately cautious and will sometimes ask about a harmless line. It will also miss a destructive action hidden in a novel way. Read the command before you approve it.
+- Destructive-command detection is deliberately cautious and will sometimes ask about a harmless line. It can miss destructive behavior hidden in novel syntax; the classifier is not a sandbox.
+- Shell control-flow blocks, unparseable commands, and indirect `sudo`/`doas` invocations require approval even in `full_auto`; other unrecognized command patterns remain subject to heuristic limits.
+- Unknown SSH keys are rejected until you verify and add them to `~/.ssh/known_hosts` with OpenSSH. Later key changes are refused.
+- Remote file writes require review in `full_auto` because Steward cannot safely resolve remote symlinks before approval.
 - `doas` is recognized as privileged, but a password is only injected for `sudo`.
 - File tools run as the login user. Writing a root-owned file means a `sudo` shell command, which goes through approval.
+- File recovery snapshots only support previous files up to 1 MB and are retained in the database without automatic pruning.
 - There is no built-in machine. Until you add one, including this computer, the agent cannot run commands or read files.
 - Command output is drained continuously, keeping at most 64,000 bytes each of stdout and stderr, plus a truncation notice, before storing it or sending it to the model.
 - Stopping or timing out a local command kills its process group, including ordinary child processes. Processes that deliberately detach into another session can escape that group. A remote command is closed as soon as the SSH session drops; remote processes may continue, depending on the server and command.
 - There is no account system. Anyone who can run Steward as you can drive your machines, subject to the approval mode of the agent.
-- Embedding search is not implemented yet. The `MemoryIndex` protocol in `steward/core/memory_index.py` is where it would go.
+- Embedding search falls back to keyword search when the configured Ollama embedding endpoint is unavailable or returns an invalid response.
 
 ## License
 

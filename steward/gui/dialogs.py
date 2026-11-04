@@ -212,6 +212,13 @@ class SettingsDialog(QDialog):
         self.request_timeout = QSpinBox()
         self.request_timeout.setRange(5, 3600)
         self.request_timeout.setValue(int(settings.request_timeout))
+        self.memory_backend = QComboBox()
+        self.memory_backend.addItem("Keyword", "keyword")
+        self.memory_backend.addItem("Ollama embeddings", "ollama")
+        self.memory_backend.setCurrentIndex(
+            max(0, self.memory_backend.findData(settings.memory_backend))
+        )
+        self.embedding_model = QLineEdit(settings.memory_embedding_model)
         self.status = QLabel("")
         self.status.setObjectName("muted")
         self.status.setWordWrap(True)
@@ -224,6 +231,8 @@ class SettingsDialog(QDialog):
         form.addRow("History messages", self.history)
         form.addRow("Command timeout (s)", self.timeout)
         form.addRow("Model timeout (s)", self.request_timeout)
+        form.addRow("Memory search", self.memory_backend)
+        form.addRow("Embedding model", self.embedding_model)
         form.addRow("", self.status)
         hint = QLabel("These URLs are shared. Each agent still chooses its own model. Passwords are never written here.")
         hint.setObjectName("muted")
@@ -280,6 +289,8 @@ class SettingsDialog(QDialog):
         settings.history_limit = self.history.value()
         settings.command_timeout = self.timeout.value()
         settings.request_timeout = float(self.request_timeout.value())
+        settings.memory_backend = str(self.memory_backend.currentData())
+        settings.memory_embedding_model = self.embedding_model.text().strip() or "nomic-embed-text"
 
     def _save(self) -> None:
         self._apply_fields()
@@ -400,7 +411,7 @@ class MachineDialog(QDialog):
         else:
             self.status.setText(
                 "Tick This computer for the machine Steward is running on. "
-                "Leave it unticked for an SSH host. A host key is pinned the first time SSH succeeds."
+                "Leave it unticked for an SSH host. Verify its first key with OpenSSH before connecting."
             )
 
     def _sync_target(self) -> None:

@@ -1,15 +1,12 @@
-"""Note retrieval.
-
-Keyword search is the MVP. ``MemoryIndex`` is the extension point for a later
-embedding ranker (Ollama ``/api/embeddings``). Select it with
-``memory.backend`` in the config; unknown values fall back to keywords and
-the setting is left in place so a future build can pick it up.
-"""
+"""Keyword and optional Ollama embedding retrieval for agent notes."""
 
 from __future__ import annotations
 
 import re
+import math
 from typing import Protocol
+
+import httpx
 
 from steward.core.models import Note
 
@@ -49,27 +46,68 @@ class KeywordMemoryIndex:
 
 
 class OllamaEmbeddingIndex:
-    """Hook for a future embedding ranker. Not used by the agent loop.
+    """Rank notes with Ollama embeddings, falling back to keyword search."""
 
-    A later version can embed ``note.title + note.content`` with
-    ``POST {base_url}/api/embeddings`` and rank by cosine similarity against
-    the user message. Keep ``KeywordMemoryIndex`` as the fallback when the
-    embed server is down.
-    """
-
-    def __init__(self, base_url: str, model: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        *,
+        transport: httpx.BaseTransport | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.transport = transport
 
     def search(self, notes: list[Note], query: str, limit: int) -> list[Note]:
-        raise NotImplementedError(
-            "Ollama embedding search is not implemented yet. "
-            "Leave memory.backend set to 'keyword'."
-        )
+        if limit <= 0 or not notes:
+            return []
+        texts = [f"{note.title}\n{note.content}\n{note.tags}" for note in notes]
+        try:
+            kwargs = {"base_url": self.base_url, "timeout": 30.0}
+            if self.transport is not None:
+                kwargs["transport"] = self.transport
+            with httpx.Client(**kwargs) as client:
+                response = client.post(
+                    "/api/embed",
+                    json={"model": self.model, "input": [query, *texts]},
+                )
+                response.raise_for_status()
+                embeddings = response.json().get("embeddings")
+            vectors = [[float(value) for value in vector] for vector in embeddings]
+            if len(vectors) != len(notes) + 1 or not vectors[0]:
+                raise ValueError("Ollama returned an unexpected embedding count.")
+            query_vector = vectors[0]
+            ranked = []
+            for note, vector in zip(notes, vectors[1:]):
+                if len(vector) != len(query_vector):
+                    raise ValueError("Ollama returned embeddings with different dimensions.")
+                score = _cosine_similarity(query_vector, vector)
+                ranked.append((score, note.updated_at, note))
+            ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return [note for _score, _updated, note in ranked[:limit]]
+        except (httpx.HTTPError, TypeError, ValueError, KeyError):
+            return KeywordMemoryIndex().search(notes, query, limit)
 
 
-def get_memory_index(backend_name: str) -> MemoryIndex:
+def get_memory_index(
+    backend_name: str,
+    *,
+    base_url: str = "",
+    embedding_model: str = "",
+) -> MemoryIndex:
     if backend_name in {"", "keyword"}:
         return KeywordMemoryIndex()
+    if backend_name == "ollama" and base_url and embedding_model:
+        return OllamaEmbeddingIndex(base_url, embedding_model)
     # Unknown / future backends stay on keywords until they are implemented.
     return KeywordMemoryIndex()
+
+
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    dot = sum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
+    return dot / (left_norm * right_norm)

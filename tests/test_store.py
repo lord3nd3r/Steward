@@ -1,7 +1,9 @@
 import pytest
+import httpx
 
 from steward.core.errors import StewardError
-from steward.core.models import Machine, ToolCall
+from steward.core.memory_index import OllamaEmbeddingIndex
+from steward.core.models import Machine, Note, ToolCall
 from steward.core.settings import Settings
 from steward.core.store import Store
 
@@ -12,12 +14,37 @@ def test_settings_roundtrip(tmp_path, monkeypatch):
     assert settings.ollama_base_url.startswith("http")
     settings.ollama_base_url = "http://127.0.0.1:11435"
     settings.max_steps = 9
+    settings.memory_backend = "ollama"
+    settings.memory_embedding_model = "embed-model"
     settings.save()
     again = Settings.load()
     assert again.ollama_base_url == "http://127.0.0.1:11435"
     assert again.max_steps == 9
+    assert again.memory_backend == "ollama"
+    assert again.memory_embedding_model == "embed-model"
     monkeypatch.setenv("STEWARD_OLLAMA_URL", "http://example.test:1")
     assert Settings.load().ollama_base_url == "http://example.test:1"
+
+
+def test_config_and_database_files_are_private_under_permissive_umask(tmp_path, monkeypatch):
+    import os
+    import stat
+
+    monkeypatch.setenv("STEWARD_CONFIG_DIR", str(tmp_path / "private-config"))
+    monkeypatch.setenv("STEWARD_DATA_DIR", str(tmp_path / "private-data"))
+    previous_umask = os.umask(0)
+    try:
+        Settings().save()
+        store = Store()
+    finally:
+        os.umask(previous_umask)
+
+    config_dir = tmp_path / "private-config"
+    data_dir = tmp_path / "private-data"
+    assert stat.S_IMODE(config_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(data_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((config_dir / "config.toml").stat().st_mode) == 0o600
+    assert stat.S_IMODE(store.db_path.stat().st_mode) == 0o600
 
 
 def test_agent_and_note_lifecycle():
@@ -74,6 +101,60 @@ def test_fresh_store_has_no_agents_or_machines():
     again = Store(store.db_path)
     assert again.list_agents() == []
     assert again.list_machines() == []
+
+
+def test_file_backup_roundtrip():
+    store = Store()
+    agent = store.create_agent("Workshop", model="qwen2.5")
+    before = store.save_file_backup(agent.id, "box", "/tmp/config", b"old content")
+    created = store.save_file_backup(agent.id, "box", "/tmp/new", None)
+
+    restored = store.get_file_backup(before.id)
+    assert restored is not None
+    assert restored.existed and restored.content == b"old content"
+    assert store.get_file_backup(created.id).existed is False
+
+
+def test_database_backup_is_private_and_refuses_overwrite(tmp_path):
+    import sqlite3
+    import stat
+
+    store = Store()
+    store.create_agent("Backup", model="test")
+    destination = tmp_path / "snapshot.db"
+    saved = store.backup_to(destination)
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+    with sqlite3.connect(saved) as conn:
+        assert conn.execute("SELECT name FROM agents").fetchone()[0] == "Backup"
+    with pytest.raises(StewardError, match="already exists"):
+        store.backup_to(destination)
+    assert store.backup_to(destination, overwrite=True) == destination
+    with pytest.raises(StewardError, match="differ from the live database"):
+        store.backup_to(store.db_path, overwrite=True)
+
+
+def test_ollama_embedding_rank_and_keyword_fallback():
+    notes = [
+        Note(1, "agent", "Camera", "webcam troubleshooting", "", "2026-01-01", "2026-01-01"),
+        Note(2, "agent", "Coffee", "black coffee", "", "2026-01-02", "2026-01-02"),
+    ]
+
+    def embedding_response(_request):
+        return httpx.Response(200, json={"embeddings": [[1, 0], [0.9, 0.1], [0, 1]]})
+
+    index = OllamaEmbeddingIndex(
+        "http://ollama.test",
+        "embed-model",
+        transport=httpx.MockTransport(embedding_response),
+    )
+    assert index.search(notes, "webcam", 2)[0].title == "Camera"
+
+    fallback = OllamaEmbeddingIndex(
+        "http://ollama.test",
+        "embed-model",
+        transport=httpx.MockTransport(lambda _request: httpx.Response(503)),
+    )
+    assert fallback.search(notes, "coffee", 2)[0].title == "Coffee"
 
 
 def test_machine_registry_requires_an_explicit_target_and_updates():

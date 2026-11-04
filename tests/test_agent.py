@@ -65,6 +65,39 @@ def test_loop_runs_a_command_then_answers(tmp_path):
     assert any(message.role == "assistant" and message.content == "Wrote hi." for message in store.list_messages(agent.id))
 
 
+def test_write_approval_includes_diff_and_backup_id(tmp_path):
+    target = tmp_path / "settings.ini"
+    target.write_text("mode=old\n")
+    backend = ScriptedBackend(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCall(
+                        id="write1",
+                        name="write_file",
+                        arguments={"path": str(target), "content": "mode=new\n"},
+                    )
+                ],
+            ),
+            LLMResponse(content="Updated the setting."),
+        ]
+    )
+    store = Store()
+    add_computer(store)
+    agent = store.create_agent("House", model="scripted", approval_mode="ask")
+    requests = []
+    _runner(store, backend).run_turn(
+        agent.id,
+        "change the setting",
+        approval_handler=lambda request: requests.append(request) or _approve_all(request),
+    )
+    assert "-mode=old" in requests[0].summary
+    assert "+mode=new" in requests[0].summary
+    assert requests[0].machine == store.list_machines()[0].name
+    assert "Backup ID:" in store.list_tool_events(agent.id)[0].result
+
+
 def test_denied_command_does_not_run(tmp_path):
     target = tmp_path / "nope"
     backend = ScriptedBackend(

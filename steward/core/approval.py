@@ -35,6 +35,10 @@ _SIMPLE_READONLY = {
 
 _WRAPPERS = {"env", "command", "time", "nice", "nohup", "stdbuf"}
 _WRAPPERS_WITH_ARG = {"-n", "--adjustment", "-o", "--output", "-e", "--arg"}
+_SHELL_CONTROL = {
+    "!", "if", "then", "elif", "else", "fi", "for", "while", "until", "do", "done",
+    "case", "esac", "select", "function",
+}
 _SUDO_WITH_ARG = {
     "-u", "-g", "-p", "-C", "-T", "-h", "-R", "--user", "--group", "--prompt",
     "--role", "--chdir", "--close-from", "--host",
@@ -66,14 +70,23 @@ def classify_command(command: str) -> CommandAssessment:
     level = "readonly"
     reasons: list[str] = []
     needs_sudo = False
+    requires_review = False
 
     for stage in _split_stages(text):
         stage_level, stage_sudo, stage_reasons = _classify_stage(stage)
         needs_sudo = needs_sudo or stage_sudo
         reasons.extend(stage_reasons)
         level = _worse(level, stage_level)
+        try:
+            tokens = shlex.split(stage, posix=True)
+        except ValueError:
+            requires_review = True
+        else:
+            requires_review = requires_review or bool(tokens and tokens[0] in _SHELL_CONTROL)
+            if re.search(r"\b(?:sudo|doas)\b", stage) and not _stage_uses_sudo(stage):
+                requires_review = True
 
-    return CommandAssessment(level, needs_sudo, tuple(reasons))
+    return CommandAssessment(level, needs_sudo, tuple(reasons), requires_review)
 
 
 def needs_human_approval(
@@ -93,6 +106,9 @@ def needs_human_approval(
             reason += f" ({assessment.reasons[0]})"
         reason += ". Steward always asks before running this."
         return True, reason, False
+
+    if assessment and assessment.requires_review:
+        return True, "Steward cannot safely classify this action. Review it before running.", False
 
     if approval_class == "safe":
         return False, "", False
@@ -173,7 +189,7 @@ def _worse(left: str, right: str) -> str:
 
 def _classify_stage(stage: str) -> tuple[str, bool, list[str]]:
     code = _strip_quotes(stage)
-    needs_sudo = False
+    needs_sudo = _stage_uses_sudo(stage)
     reasons: list[str] = []
 
     structural = _structural_danger(code)
@@ -196,6 +212,8 @@ def _classify_stage(stage: str) -> tuple[str, bool, list[str]]:
         tokens = shlex.split(stage, posix=True)
     except ValueError:
         return "mutating", _stage_uses_sudo(stage), ["could not parse the command"]
+    while tokens and tokens[0] in _SHELL_CONTROL:
+        tokens = tokens[1:]
 
     # Expansion in double quotes is executable shell syntax too. Treat
     # constructs our small stage parser does not understand conservatively.
@@ -496,10 +514,14 @@ def _command_needs_sudo(command: str) -> bool:
 
 
 def _stage_uses_sudo(stage: str) -> bool:
+    if _rewrite_sudo(stage)[1]:
+        return True
     try:
         tokens = shlex.split(stage, posix=True)
     except ValueError:
         return bool(re.search(r"(^|[;&|(`])\s*(sudo|doas)\b", stage))
+    while tokens and tokens[0] in _SHELL_CONTROL:
+        tokens = tokens[1:]
     _, used = _unwrap(tokens)
     return used
 
@@ -615,4 +637,7 @@ def _sudo_at(command: str, index: int) -> bool:
     before = command[:index].rstrip()
     if before == "":
         return True
-    return before.endswith((";", "|", "&", "(", "`"))
+    return (
+        before.endswith((";", "|", "&", "(", "`", ")"))
+        or bool(re.search(r"\b(?:if|then|elif|else|while|until|do)\s*$|!\s*$", before))
+    )

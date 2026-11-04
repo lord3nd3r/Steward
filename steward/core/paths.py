@@ -32,3 +32,8 @@ def config_path() -> Path:
 
 def database_path() -> Path:
     return data_dir() / "steward.db"
+
+
+def ensure_private_dir(path: Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.chmod(0o700)

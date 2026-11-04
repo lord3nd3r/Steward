@@ -1,6 +1,6 @@
 """Built-in tools and the default registry."""
 
-from steward.core.tools.files import ListDirectoryTool, ReadFileTool, WriteFileTool
+from steward.core.tools.files import ListDirectoryTool, ReadFileTool, RestoreFileTool, WriteFileTool
 from steward.core.tools.memory import ForgetNoteTool, SaveNoteTool, SearchNotesTool
 from steward.core.tools.registry import ToolRegistry
 from steward.core.tools.shell import RunCommandTool
@@ -14,6 +14,7 @@ def default_registry() -> ToolRegistry:
         RunCommandTool(),
         ReadFileTool(),
         WriteFileTool(),
+        RestoreFileTool(),
         ListDirectoryTool(),
         SaveNoteTool(),
         SearchNotesTool(),

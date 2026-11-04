@@ -63,3 +63,14 @@ def test_fresh_cli_invites_the_first_agent_and_this_computer():
     assert machines.exit_code == 0
     assert "steward machines add <name> --local" in " ".join(machines.stdout.split())
     assert "box" not in machines.stdout
+
+
+def test_cli_creates_database_backup(tmp_path):
+    destination = tmp_path / "steward-export.db"
+    created = runner.invoke(app, ["backup", "--output", str(destination)])
+    assert created.exit_code == 0, created.stdout
+    assert destination.exists()
+    duplicate = runner.invoke(app, ["backup", "--output", str(destination)])
+    assert duplicate.exit_code == 1
+    replaced = runner.invoke(app, ["backup", "--output", str(destination), "--overwrite"])
+    assert replaced.exit_code == 0, replaced.stdout
